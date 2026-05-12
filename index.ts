@@ -527,10 +527,15 @@ export default function (pi: ExtensionAPI) {
     if (!index.chunks.length) return;
 
     if (isIndexStale(index)) {
-      const existingFiles = Object.keys(index.files).filter(f => existsSync(f));
-      if (existingFiles.length) {
-        stderrProgress(`[rag] Index stale, refreshing ${existingFiles.length} files…`);
-        await indexFiles(existingFiles);
+      // Re-walk tracked paths so new files (and files of newly-supported
+      // extensions, e.g. PDF/DOCX added in a later version) are picked up.
+      // For pre-trackedPaths indexes, fall back to refreshing only known files.
+      const files = config.trackedPaths.length
+        ? collectFromTracked(config)
+        : Object.keys(index.files).filter(f => existsSync(f));
+      if (files.length) {
+        stderrProgress(`[rag] Index stale, refreshing ${files.length} files…`);
+        await indexFiles(files);
         process.stderr.write(`\r\x1b[2K`);
         index = loadIndex();
       }
