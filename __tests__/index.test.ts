@@ -1,7 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdirSync, writeFileSync, rmSync, mkdtempSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, writeFileSync, rmSync, mkdtempSync, readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const FIXTURES_DIR = join(__dirname, "fixtures");
+const SAMPLE_PDF = readFileSync(join(FIXTURES_DIR, "sample.pdf"));
 
 import {
   chunkText,
@@ -13,7 +18,39 @@ import {
   isExcludedByConfig,
   hybridSearch,
   defaultConfig,
+  extractText,
 } from "../index.ts";
+
+async function buildMinimalDocx(text: string): Promise<Buffer> {
+  const { default: JSZip } = await import("jszip");
+  const zip = new JSZip();
+  zip.file(
+    "[Content_Types].xml",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>`,
+  );
+  zip.folder("_rels")!.file(
+    ".rels",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>`,
+  );
+  zip.folder("word")!.file(
+    "document.xml",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>${text}</w:t></w:r></w:p>
+  </w:body>
+</w:document>`,
+  );
+  return await zip.generateAsync({ type: "nodebuffer" });
+}
 
 // ─── sha256 ──────────────────────────────────────────────────────────────────
 
@@ -275,6 +312,77 @@ describe("collectFiles", () => {
     const fp = join(tmp, "secret.ts");
     writeFileSync(fp, "x");
     expect(collectFiles(fp, ["secret.ts"])).toEqual([]);
+  });
+
+  it("includes .pdf files", () => {
+    const fp = join(tmp, "doc.pdf");
+    writeFileSync(fp, SAMPLE_PDF);
+    expect(collectFiles(tmp)).toEqual([fp]);
+  });
+
+  it("includes .docx files", async () => {
+    const fp = join(tmp, "doc.docx");
+    writeFileSync(fp, await buildMinimalDocx("Hello"));
+    expect(collectFiles(tmp)).toEqual([fp]);
+  });
+
+  it("binary docs use the 10 MB size cap, not the 500 KB text cap", () => {
+    const fp = join(tmp, "big.pdf");
+    writeFileSync(fp, Buffer.alloc(600_000)); // would be rejected as text, accepted as binary doc
+    expect(collectFiles(tmp)).toEqual([fp]);
+  });
+
+  it("skips binary docs >= 10 MB", () => {
+    const fp = join(tmp, "huge.pdf");
+    writeFileSync(fp, Buffer.alloc(10_000_000));
+    expect(collectFiles(tmp)).toEqual([]);
+  });
+});
+
+// ─── extractText ─────────────────────────────────────────────────────────────
+
+describe("extractText", () => {
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "rag-extract-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("reads plain text files as utf-8", async () => {
+    const fp = join(tmp, "a.txt");
+    writeFileSync(fp, "hello world");
+    const { text, hash, size } = await extractText(fp);
+    expect(text).toBe("hello world");
+    expect(hash).toBe(sha256("hello world"));
+    expect(size).toBe(11);
+  });
+
+  it("extracts text from a .pdf", async () => {
+    const fp = join(tmp, "a.pdf");
+    writeFileSync(fp, SAMPLE_PDF);
+    const { text, hash, size } = await extractText(fp);
+    expect(text).toContain("RagPdfMarker");
+    expect(hash).toMatch(/^[0-9a-f]{12}$/);
+    expect(size).toBe(SAMPLE_PDF.length);
+  });
+
+  it("extracts text from a .docx", async () => {
+    const fp = join(tmp, "a.docx");
+    writeFileSync(fp, await buildMinimalDocx("RagDocxMarker"));
+    const { text } = await extractText(fp);
+    expect(text).toContain("RagDocxMarker");
+  });
+
+  it("hash is stable across reads of the same binary file (skip-on-rebuild)", async () => {
+    const fp = join(tmp, "stable.pdf");
+    writeFileSync(fp, SAMPLE_PDF);
+    const a = await extractText(fp);
+    const b = await extractText(fp);
+    expect(a.hash).toBe(b.hash);
   });
 });
 

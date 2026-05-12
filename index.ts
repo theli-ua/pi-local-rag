@@ -42,6 +42,11 @@ const TEXT_EXTS = new Set([
   ".sql", ".graphql", ".proto", ".env", ".gitignore", ".dockerfile",
 ]);
 
+const BINARY_DOC_EXTS = new Set([".pdf", ".docx"]);
+
+const TEXT_MAX_BYTES = 500_000;
+const BINARY_DOC_MAX_BYTES = 10_000_000;
+
 const SKIP_DIRS = new Set([
   "node_modules", ".git", ".next", "dist", "build", "__pycache__", ".venv", "venv", ".cache",
 ]);
@@ -259,10 +264,17 @@ export function collectFiles(dirPath: string, excludePatterns: string[] = []): s
     return ig.ignores(rel);
   }
 
+  function acceptable(fp: string, size: number): boolean {
+    const ext = extname(fp).toLowerCase();
+    if (TEXT_EXTS.has(ext)) return size < TEXT_MAX_BYTES;
+    if (BINARY_DOC_EXTS.has(ext)) return size < BINARY_DOC_MAX_BYTES;
+    return false;
+  }
+
   try {
     const stat = statSync(dirPath);
     if (stat.isFile()) {
-      if (!TEXT_EXTS.has(extname(dirPath).toLowerCase()) || stat.size >= 500_000) return [];
+      if (!acceptable(dirPath, stat.size)) return [];
       if (ig && ig.ignores(basename(dirPath))) return [];
       return [dirPath];
     }
@@ -277,10 +289,12 @@ export function collectFiles(dirPath: string, excludePatterns: string[] = []): s
           if (SKIP_DIRS.has(entry.name) || entry.name.startsWith(".")) continue;
           if (isExcluded(fp, root)) continue;
           walk(fp);
-        } else if (TEXT_EXTS.has(extname(entry.name).toLowerCase())) {
+        } else {
+          const ext = extname(entry.name).toLowerCase();
+          if (!TEXT_EXTS.has(ext) && !BINARY_DOC_EXTS.has(ext)) continue;
           if (isExcluded(fp, root)) continue;
           try {
-            if (statSync(fp).size < 500_000) files.push(fp);
+            if (acceptable(fp, statSync(fp).size)) files.push(fp);
           } catch {}
         }
       }
@@ -313,6 +327,30 @@ export function isExcludedByConfig(file: string, roots: string[], excludePattern
 
 // ─── Indexing ─────────────────────────────────────────────────────────────────
 
+/**
+ * Read and decode a file into UTF-8 text. PDF and DOCX are routed through
+ * extraction libraries; everything else is read as plain UTF-8. Hash is
+ * computed over the raw bytes for binaries (so the source file's identity
+ * drives skip-on-rebuild) and over the decoded text for plain text files.
+ */
+export async function extractText(fp: string): Promise<{ text: string; hash: string; size: number }> {
+  const ext = extname(fp).toLowerCase();
+  if (ext === ".pdf") {
+    const buf = readFileSync(fp);
+    const { default: pdf } = await import("pdf-parse/lib/pdf-parse.js");
+    const data = await pdf(buf);
+    return { text: data.text, hash: sha256(buf.toString("binary")), size: buf.length };
+  }
+  if (ext === ".docx") {
+    const buf = readFileSync(fp);
+    const { default: mammoth } = await import("mammoth");
+    const { value } = await mammoth.extractRawText({ buffer: buf });
+    return { text: value, hash: sha256(buf.toString("binary")), size: buf.length };
+  }
+  const text = readFileSync(fp, "utf-8");
+  return { text, hash: sha256(text), size: text.length };
+}
+
 interface ProgressCallbacks {
   onFile?: (current: number, total: number, filename: string, skipped: number) => void;
   onChunk?: (fileChunk: number, totalChunks: number, filename: string) => void;
@@ -342,8 +380,7 @@ export async function indexFiles(
     const name = basename(fp);
 
     try {
-      const content = readFileSync(fp, "utf-8");
-      const hash = sha256(content);
+      const { text: content, hash, size } = await extractText(fp);
 
       if (index.files[fp]?.hash === hash && index.files[fp]?.embedded) {
         skipped++;
@@ -384,7 +421,7 @@ export async function indexFiles(
         chunked++;
       }
 
-      index.files[fp] = { hash, chunks: rawChunks.length, indexed: new Date().toISOString(), size: content.length, embedded: true };
+      index.files[fp] = { hash, chunks: rawChunks.length, indexed: new Date().toISOString(), size, embedded: true };
       indexed++;
     } catch { skipped++; }
   }
@@ -775,7 +812,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "rag_index",
     label: "RAG index",
-    description: "Index a file or directory into the local pi-local-rag pipeline. Chunks text files, generates embeddings, stores for hybrid BM25+vector search.",
+    description: "Index a file or directory into the local pi-local-rag pipeline. Chunks text files (including PDF and DOCX), generates embeddings, stores for hybrid BM25+vector search.",
     parameters: Type.Object({
       path: Type.String({ description: "File or directory path to index" }),
     }),
@@ -789,7 +826,7 @@ export default function (pi: ExtensionAPI) {
         saveConfig(config);
       }
       const files = collectFiles(absPath, config.excludePatterns);
-      if (!files.length) return { content: [{ type: "text" as const, text: `No indexable text files found in: ${params.path}` }], details: undefined };
+      if (!files.length) return { content: [{ type: "text" as const, text: `No indexable files found in: ${params.path}` }], details: undefined };
       const result = await indexFiles(files, {});
       process.stderr.write(`\n`);
       return { content: [{ type: "text" as const, text: `Indexed ${result.indexed} files (${result.chunks} chunks, embeddings generated). ${result.skipped} unchanged. ${(result.durationMs / 1000).toFixed(1)}s` }], details: undefined };
