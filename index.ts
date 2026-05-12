@@ -34,7 +34,7 @@ const EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
 const VECTOR_DIM = 384;
 
 const TEXT_EXTS = new Set([
-  ".md", ".txt", ".ts", ".js", ".py", ".rs", ".go", ".java", ".c", ".cpp", ".h",
+  ".md", ".txt", ".ts", ".js", ".py", ".rs", ".go", ".java", ".c", ".cpp", ".h", ".cs",
   ".css", ".html", ".json", ".yaml", ".yml", ".toml", ".xml", ".csv", ".sh",
   ".sql", ".graphql", ".proto", ".env", ".gitignore", ".dockerfile",
 ]);
