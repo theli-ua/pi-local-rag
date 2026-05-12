@@ -467,24 +467,26 @@ export default function (pi: ExtensionAPI) {
       // ── search ──
       if (cmd === "search") {
         const query = parts.slice(1).join(" ");
-        if (!query) return `${YELLOW}Usage:${RST} /rag search <query>`;
+        if (!query) pi.sendMessage({ customType: "rag-search", content: "**Usage:** `/rag search <query>`", display: true });
         const index = loadIndex();
         const config = loadConfig();
         const results = await hybridSearch(query, index, 10, config.ragAlpha);
-        if (!results.length) return `${YELLOW}No results for:${RST} ${query}`;
+        if (!results.length) {
+          pi.sendMessage({ customType: "rag-search", content: `No results for: \`${query}\``, display: true });
+          return;
+        }
 
         const hasVectors = index.chunks.some(c => c.vector);
-        let out = `${B}${CYAN}🔍 ${results.length} results for "${query}"${RST}`;
-        out += ` ${D}(${hasVectors ? "hybrid BM25+vector" : "BM25 only — run /rag index to add vectors"})${RST}\n\n`;
+        let md = `## 🔍 ${results.length} results for "${query}"\n\n`;
+        md += `*${hasVectors ? "hybrid BM25+vector" : "BM25 only — run /rag index to add vectors"}*\n\n`;
 
         for (const r of results) {
           const bar = "█".repeat(Math.round(r.hybrid * 10)) + "░".repeat(10 - Math.round(r.hybrid * 10));
-          out += `${GREEN}${basename(r.chunk.file)}${RST}:${r.chunk.lineStart}-${r.chunk.lineEnd} `;
-          out += `${D}bm25=${r.bm25.toFixed(2)} vec=${r.vector.toFixed(2)} hybrid=${r.hybrid.toFixed(2)}${RST} ${CYAN}${bar}${RST}\n`;
+          md += `- **${basename(r.chunk.file)}**:${r.chunk.lineStart}-${r.chunk.lineEnd} \`bm25=${r.bm25.toFixed(2)} vec=${r.vector.toFixed(2)} hybrid=${r.hybrid.toFixed(2)}\` ${bar}\n`;
           const preview = r.chunk.content.split("\n").slice(0, 3).join("\n");
-          out += `${D}${preview.slice(0, 200)}${RST}\n\n`;
+          md += "  ```\n" + preview.slice(0, 200) + "\n  ```\n\n";
         }
-        return out;
+        pi.sendMessage({ customType: "rag-search", content: md, display: true });
       }
 
       // ── on/off toggle ──
@@ -563,26 +565,27 @@ export default function (pi: ExtensionAPI) {
       const embeddedCount = index.chunks.filter(c => c.vector).length;
       const vectorCoverage = index.chunks.length ? Math.round(embeddedCount / index.chunks.length * 100) : 0;
 
-      let out = `${B}${CYAN}🔍 pi-local-rag Status${RST}\n\n`;
-      out += `  Files indexed:   ${GREEN}${fileCount}${RST}\n`;
-      out += `  Chunks:          ${GREEN}${index.chunks.length}${RST}\n`;
-      out += `  Vectors:         ${GREEN}${embeddedCount}${RST} ${D}(${vectorCoverage}% coverage)${RST}\n`;
-      out += `  Total tokens:    ${GREEN}${totalTokens.toLocaleString()}${RST}\n`;
-      out += `  Embedding model: ${D}${index.embeddingModel || "none"}${RST}\n`;
-      out += `  Last build:      ${index.lastBuild || "never"}\n`;
-      out += `  Storage:         ${D}${RAG_DIR}${RST}\n\n`;
-      out += `  RAG injection:   ${config.ragEnabled ? `${GREEN}enabled${RST}` : `${YELLOW}disabled${RST}`}`;
-      out += `  topK=${config.ragTopK}  threshold=${config.ragScoreThreshold}  alpha=${config.ragAlpha}\n`;
+      let md = `## 🔍 pi-local-rag Status\n\n`;
+      md += `| Metric | Value |\n|---|---|\n`;
+      md += `| Files indexed | ${fileCount} |\n`;
+      md += `| Chunks | ${index.chunks.length} |\n`;
+      md += `| Vectors | ${embeddedCount} (${vectorCoverage}% coverage) |\n`;
+      md += `| Total tokens | ${totalTokens.toLocaleString()} |\n`;
+      md += `| Embedding model | ${index.embeddingModel || "none"} |\n`;
+      md += `| Last build | ${index.lastBuild || "never"} |\n`;
+      md += `| Storage | \`${RAG_DIR}\` |\n\n`;
+      md += `**RAG injection:** ${config.ragEnabled ? "enabled ✅" : "disabled ⚠️"}  \n`;
+      md += `\`topK=${config.ragTopK}\`  \`threshold=${config.ragScoreThreshold}\`  \`alpha=${config.ragAlpha}\`\n`;
 
       if (fileCount) {
-        out += `\n  ${B}File types:${RST}\n`;
+        md += `\n### File types\n\n`;
         const byExt: Record<string, number> = {};
         for (const f of Object.keys(index.files)) byExt[extname(f)] = (byExt[extname(f)] || 0) + 1;
         for (const [ext, count] of Object.entries(byExt).sort((a, b) => b[1] - a[1]).slice(0, 8)) {
-          out += `    ${ext}: ${count}\n`;
+          md += `- \`${ext}\`: ${count}\n`;
         }
       }
-      return out;
+      pi.sendMessage({ customType: "rag-status", content: md, display: true });
     },
   });
 
