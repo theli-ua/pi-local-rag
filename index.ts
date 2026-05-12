@@ -14,6 +14,7 @@
  * Tools: rag_index, rag_query, rag_status
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, renameSync } from "node:fs";
 import { join, extname, basename } from "node:path";
@@ -568,8 +569,24 @@ export default function (pi: ExtensionAPI) {
   }
 
   // ── /rag command ──
+  const RAG_SUBCOMMANDS: { value: string; label: string; description: string }[] = [
+    { value: "index", label: "index", description: "Index a file or directory" },
+    { value: "search", label: "search", description: "Search the index" },
+    { value: "status", label: "status", description: "Show index statistics" },
+    { value: "rebuild", label: "rebuild", description: "Rebuild entire index" },
+    { value: "clear", label: "clear", description: "Clear the index" },
+    { value: "on", label: "on", description: "Enable auto-injection" },
+    { value: "off", label: "off", description: "Disable auto-injection" },
+  ];
+
   pi.registerCommand("rag", {
     description: "pi-local-rag: /rag index|search|status|rebuild|clear|on|off",
+    getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
+      const filtered = RAG_SUBCOMMANDS
+        .filter((s) => s.value.startsWith(prefix))
+        .map((s) => ({ value: s.value, label: s.label, description: s.description }));
+      return filtered.length > 0 ? filtered : null;
+    },
     handler: async (args, ctx) => {
       const parts = (args || "").trim().split(/\s+/);
       const cmd = parts[0] || "status";
