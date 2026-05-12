@@ -587,7 +587,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── /rag command ──
   pi.registerCommand("rag", {
-    description: "pi-local-rag: /rag index|search|status|rebuild|clear|exclude|on|off",
+    description: "pi-local-rag: /rag index|search|find|status|rebuild|clear|exclude|on|off",
     handler: async (args, ctx) => {
       const reply = (text: string) => pi.sendMessage({ customType: "rag", content: text, display: true });
       const parts = (args || "").trim().split(/\s+/);
@@ -784,6 +784,29 @@ export default function (pi: ExtensionAPI) {
       if (cmd === "clear") {
         saveIndex({ chunks: [], files: {}, lastBuild: "" });
         return reply(`${GREEN}✅ Index cleared.${RST}`);
+      }
+
+      // ── find ──
+      if (cmd === "find") {
+        const glob = parts.slice(1).join(" ").trim();
+        if (!glob) return reply(`${YELLOW}Usage:${RST} /rag find <glob>   ${D}e.g. *.html, page*, foo.js, src/*.ts${RST}`);
+
+        const index = loadIndex();
+        const cwd = process.cwd();
+        const ig = ignore().add([glob]);
+
+        const matches: string[] = [];
+        for (const fp of Object.keys(index.files)) {
+          const rel = relative(cwd, fp);
+          const candidate = rel && !rel.startsWith("..") ? rel : basename(fp);
+          if (ig.ignores(candidate)) matches.push(fp);
+        }
+        matches.sort();
+
+        if (!matches.length) return reply(`${YELLOW}No indexed files match:${RST} ${glob}`);
+        let out = `${B}${CYAN}🔍 ${matches.length} indexed file${matches.length === 1 ? "" : "s"} matching "${glob}"${RST}\n\n`;
+        for (const fp of matches) out += `${GREEN}${fp}${RST}\n`;
+        return reply(out);
       }
 
       // ── status (default) ──
