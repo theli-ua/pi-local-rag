@@ -425,9 +425,9 @@ export default function (pi: ExtensionAPI) {
       // ── index ──
       if (cmd === "index") {
         const path = parts[1] || ".";
-        if (!existsSync(path)) return `${RED}Path not found:${RST} ${path}`;
+        if (!existsSync(path)) { ctx.ui.notify(`Path not found: ${path}`, "error"); return; }
         const files = collectFiles(path);
-        if (!files.length) return `${YELLOW}No indexable files found in:${RST} ${path}`;
+        if (!files.length) { ctx.ui.notify(`No indexable files found in: ${path}`, "warning"); return; }
 
         const total = files.length;
         ctx.ui.notify(`Found ${total} files to index`, "info");
@@ -460,8 +460,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.setWidget("rag", undefined);
 
         const secs = (result.durationMs / 1000).toFixed(1);
-        return `${GREEN}✅ Indexed:${RST} ${result.indexed} files (${result.chunks} chunks) │ ${result.skipped} unchanged │ ${secs}s\n` +
-          `${D}Model: ${EMBEDDING_MODEL} │ Storage: ${RAG_DIR}${RST}`;
+        ctx.ui.notify(`Indexed: ${result.indexed} files (${result.chunks} chunks) │ ${result.skipped} unchanged │ ${secs}s`, "success");
       }
 
       // ── search ──
@@ -494,16 +493,14 @@ export default function (pi: ExtensionAPI) {
         const config = loadConfig();
         config.ragEnabled = cmd === "on";
         saveConfig(config);
-        return cmd === "on"
-          ? `${GREEN}✅ RAG auto-injection enabled${RST}`
-          : `${YELLOW}RAG auto-injection disabled${RST}`;
+        ctx.ui.notify(cmd === "on" ? "RAG auto-injection enabled" : "RAG auto-injection disabled", cmd === "on" ? "success" : "warning");
       }
 
       // ── rebuild ──
       if (cmd === "rebuild") {
         const index = loadIndex();
         const allFiles = Object.keys(index.files);
-        if (!allFiles.length) return `${YELLOW}No files in index. Run /rag index <path> first.${RST}`;
+        if (!allFiles.length) { ctx.ui.notify("No files in index. Run /rag index <path> first.", "warning"); return; }
 
         const existingFiles = allFiles.filter(f => existsSync(f));
         const deletedFiles = allFiles.filter(f => !existsSync(f));
@@ -548,13 +545,13 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.setWidget("rag", undefined);
 
         const secs = (result.durationMs / 1000).toFixed(1);
-        return `${GREEN}✅ Rebuilt:${RST} ${result.indexed} re-indexed │ ${result.skipped} unchanged │ ${deletedFiles.length} deleted │ ${result.chunks} chunks │ ${secs}s`;
+        ctx.ui.notify(`Rebuilt: ${result.indexed} re-indexed │ ${result.skipped} unchanged │ ${deletedFiles.length} deleted │ ${result.chunks} chunks │ ${secs}s`, "success");
       }
 
       // ── clear ──
       if (cmd === "clear") {
         saveIndex({ chunks: [], files: {}, lastBuild: "" });
-        return `${GREEN}✅ Index cleared.${RST}`;
+        ctx.ui.notify("Index cleared.", "success");
       }
 
       // ── status (default) ──
