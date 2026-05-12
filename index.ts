@@ -333,10 +333,24 @@ export function isExcludedByConfig(file: string, roots: string[], excludePattern
  * computed over the raw bytes for binaries (so the source file's identity
  * drives skip-on-rebuild) and over the decoded text for plain text files.
  */
+let _pdfjsSilenced = false;
+async function silencePdfjsWarnings(): Promise<void> {
+  if (_pdfjsSilenced) return;
+  // pdfjs (bundled inside pdf-parse) routes warnings through console.log with a
+  // "Warning: " prefix. On real-world PDFs this fires thousands of times per
+  // document ("Ran out of space in font private use area", missing glyphs, …).
+  // Drop verbosity to errors-only via the same module instance pdf-parse will
+  // require (module cache makes this a one-shot mutation).
+  const pdfjs = await import("pdf-parse/lib/pdf.js/v1.10.100/build/pdf.js");
+  if (pdfjs.default?.PDFJS) pdfjs.default.PDFJS.verbosity = 0;
+  _pdfjsSilenced = true;
+}
+
 export async function extractText(fp: string): Promise<{ text: string; hash: string; size: number }> {
   const ext = extname(fp).toLowerCase();
   if (ext === ".pdf") {
     const buf = readFileSync(fp);
+    await silencePdfjsWarnings();
     const { default: pdf } = await import("pdf-parse/lib/pdf-parse.js");
     const data = await pdf(buf);
     return { text: data.text, hash: sha256(buf.toString("binary")), size: buf.length };
