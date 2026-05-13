@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0
+
+- **SQLite storage**: replaced `index.json` with `rag.db` (SQLite + FTS5 + sqlite-vec)
+- **FTS5 BM25 search**: native SQLite full-text search with `bm25()` scoring, O(log n) lookups
+- **sqlite-vec vector search**: C-index nearest-neighbor for 384-dim embeddings
+- **Auto-migration**: legacy `index.json` files migrate to SQLite on first run, zero data loss
+- **Dependencies**: added `better-sqlite3`, `sqlite-vec`
+
 ## 0.3.0
 
 - **Renamed `/lens` → `/rag`**: all commands now use `/rag index|search|status|rebuild|clear|on|off`

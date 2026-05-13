@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
-import { mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import Database from "better-sqlite3";
+import { load as loadVec } from "sqlite-vec";
 
 // Hoisted so vi.mock factories can close over it
 const TEST_HOME = vi.hoisted(() => `/tmp/pi-rag-test-${process.pid}`);
@@ -18,13 +20,13 @@ vi.mock("@xenova/transformers", () => ({
   ),
 }));
 
-import { isIndexStale, getRagDir, loadConfig, saveConfig } from "./index.js";
+import { isIndexStale, getRagDir, loadConfig, saveConfig, openDb, getIndexStats, initSchema } from "./index.js";
 import defaultExport from "./index.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 const RAG_DIR = `${TEST_HOME}/.pi/rag`;
-const INDEX_FILE = join(RAG_DIR, "index.json");
+const DB_FILE = join(RAG_DIR, "rag.db");
 const CONFIG_FILE = join(RAG_DIR, "config.json");
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -33,13 +35,75 @@ const DEFAULT_CONFIG = { ragEnabled: true, ragTopK: 5, ragScoreThreshold: 0.1, r
 function staleTimestamp() { return new Date(Date.now() - DAY_MS - 1_000).toISOString(); }
 function freshTimestamp() { return new Date(Date.now() - 60_000).toISOString(); }
 
-function writeIndex(data: object) {
+function createTestDb(): Database.Database {
   mkdirSync(RAG_DIR, { recursive: true });
-  writeFileSync(INDEX_FILE, JSON.stringify(data));
+  const db = new Database(DB_FILE);
+  db.pragma("journal_mode = WAL");
+  loadVec(db);
+  initSchema(db);
+  return db;
+}
+
+function writeIndex(data: object) {
+  // For backward compat with tests that expect index.json-like writes,
+  // we now write to SQLite
+  mkdirSync(RAG_DIR, { recursive: true });
+  const db = new Database(DB_FILE);
+  db.pragma("journal_mode = WAL");
+  loadVec(db);
+  initSchema(db);
+
+  // Clear existing data to avoid UNIQUE constraint failures
+  db.exec("DELETE FROM chunks_vec; DELETE FROM chunks; DELETE FROM files; DELETE FROM metadata;");
+
+  if (data.chunks && Array.isArray(data.chunks)) {
+    for (const c of data.chunks) {
+      db.prepare(`
+        INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(c.id, c.file, c.content, c.lineStart, c.lineEnd, c.hash, c.indexed, c.tokens);
+      if (c.vector) {
+        const f = new Float32Array(c.vector);
+        db.prepare("INSERT INTO chunks_vec(embedding) VALUES (?)").run(
+          Buffer.from(f.buffer, f.byteOffset, f.byteLength)
+        );
+      }
+    }
+    if (data.files) {
+      for (const [fp, info] of Object.entries(data.files as Record<string, any>)) {
+        db.prepare(`
+          INSERT INTO files(path, hash, chunks, indexed, size, embedded)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(fp, info.hash, info.chunks, info.indexed, info.size, info.embedded ? 1 : 0);
+      }
+    }
+  }
+
+  if (data.lastBuild) {
+    db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('last_build', ?)").run(data.lastBuild);
+  }
+  if (data.embeddingModel) {
+    db.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('embedding_model', ?)").run(data.embeddingModel);
+  }
+
+  db.close();
 }
 
 function readIndex(): Record<string, any> {
-  return JSON.parse(readFileSync(INDEX_FILE, "utf-8"));
+  if (!existsSync(DB_FILE)) return { chunks: [], files: {}, lastBuild: "" };
+  const db = new Database(DB_FILE, { readonly: true });
+  try {
+    const chunks = db.prepare("SELECT * FROM chunks").all();
+    const files = db.prepare("SELECT * FROM files").all();
+    const meta = db.prepare("SELECT * FROM metadata").all();
+    return {
+      chunks,
+      files,
+      lastBuild: (meta.find((m: any) => m.key === "last_build") as any)?.value ?? "",
+    };
+  } finally {
+    db.close();
+  }
 }
 
 /** Minimal chunk with a pre-filled vector to pass the `!index.chunks.length` guard */
@@ -70,7 +134,7 @@ function makePi() {
   };
   const fireHook = (event = { prompt: "hello world", systemPrompt: "" }) => hookFn!(event, {});
   const run = (args: string) => ragHandler!(args, ctx);
-  return { pi, fireHook, run, messages };
+  return { pi, fireHook, run, messages, ctx };
 }
 
 // ─── isIndexStale ─────────────────────────────────────────────────────────────
@@ -187,19 +251,21 @@ describe("/rag exclude subcommand", () => {
 
   it("does not duplicate an already-present pattern", async () => {
     writeFileSync(CONFIG_FILE, JSON.stringify({ ...DEFAULT_CONFIG, excludePatterns: ["foo"] }));
-    const { pi, run, messages } = makePi();
+    const { pi, run, ctx } = makePi();
     defaultExport(pi as any);
     await run("exclude foo");
     expect(readConfig().excludePatterns).toEqual(["foo"]);
-    expect(messages.some(m => /already excluded/i.test(m))).toBe(true);
+    const notifyCalls = (ctx.ui.notify as vi.Mock).mock.calls.map((c: any[]) => c[0]);
+    expect(notifyCalls.some((m: string) => /already excluded/i.test(m))).toBe(true);
   });
 
   it("reports error when removing a non-existent pattern", async () => {
     writeFileSync(CONFIG_FILE, JSON.stringify({ ...DEFAULT_CONFIG, excludePatterns: [] }));
-    const { pi, run, messages } = makePi();
+    const { pi, run, ctx } = makePi();
     defaultExport(pi as any);
     await run("exclude -ghost");
-    expect(messages.some(m => /not found/i.test(m))).toBe(true);
+    const notifyCalls = (ctx.ui.notify as vi.Mock).mock.calls.map((c: any[]) => c[0]);
+    expect(notifyCalls.some((m: string) => /not found/i.test(m))).toBe(true);
   });
 
   it("lists current patterns when called with no argument", async () => {
@@ -283,7 +349,8 @@ describe("/rag rebuild new-file discovery", () => {
     await run("rebuild");
 
     const idx = readIndex();
-    expect(Object.keys(idx.files)).toContain(newFile);
+    const filePaths = idx.files?.map?.((f: any) => f.path) ?? Object.keys(idx.files ?? {});
+    expect(filePaths).toContain(newFile);
   });
 
   it("drops files that match a newly-added exclude pattern", async () => {
@@ -301,8 +368,9 @@ describe("/rag rebuild new-file discovery", () => {
     await run("rebuild");
 
     const idx = readIndex();
-    expect(Object.keys(idx.files)).toContain(join(projDir, "keep.ts"));
-    expect(Object.keys(idx.files)).not.toContain(join(projDir, "drop.ts"));
+    const filePaths = idx.files?.map?.((f: any) => f.path) ?? Object.keys(idx.files ?? {});
+    expect(filePaths).toContain(join(projDir, "keep.ts"));
+    expect(filePaths).not.toContain(join(projDir, "drop.ts"));
   });
 
   it("prunes files that were deleted from disk", async () => {
@@ -323,9 +391,11 @@ describe("/rag rebuild new-file discovery", () => {
     await run("rebuild");
 
     const idx = readIndex();
-    expect(Object.keys(idx.files)).toContain(keep);
-    expect(Object.keys(idx.files)).not.toContain(gone);
-    expect(idx.chunks.some((c: any) => c.file === gone)).toBe(false);
+    const filePaths = idx.files?.map?.((f: any) => f.path) ?? Object.keys(idx.files ?? {});
+    expect(filePaths).toContain(keep);
+    expect(filePaths).not.toContain(gone);
+    const chunkFiles = idx.chunks?.map?.((c: any) => c.file_path ?? c.file) ?? [];
+    expect(chunkFiles).not.toContain(gone);
   });
 });
 
@@ -429,8 +499,9 @@ describe("rag_index tool", () => {
     await ragIndex.execute("call-1", { path: projDir });
 
     const idx = readIndex();
-    expect(Object.keys(idx.files)).toContain(join(projDir, "keep.ts"));
-    expect(Object.keys(idx.files)).not.toContain(join(projDir, "drop.ts"));
+    const filePaths = idx.files?.map?.((f: any) => f.path) ?? Object.keys(idx.files ?? {});
+    expect(filePaths).toContain(join(projDir, "keep.ts"));
+    expect(filePaths).not.toContain(join(projDir, "drop.ts"));
   });
 });
 

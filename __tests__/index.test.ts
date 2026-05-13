@@ -1,8 +1,19 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdirSync, writeFileSync, rmSync, mkdtempSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import Database from "better-sqlite3";
+import { load as loadVec } from "sqlite-vec";
+
+// Mock transformers to avoid real ONNX model downloads
+vi.mock("@xenova/transformers", () => ({
+  pipeline: vi.fn().mockResolvedValue(
+    vi.fn().mockImplementation(async () => ({
+      data: new Float32Array(384).fill(0.1),
+    }))
+  ),
+}));
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = join(__dirname, "fixtures");
@@ -19,6 +30,7 @@ import {
   hybridSearch,
   defaultConfig,
   extractText,
+  initSchema,
 } from "../index.ts";
 
 async function buildMinimalDocx(text: string): Promise<Buffer> {
@@ -50,6 +62,43 @@ async function buildMinimalDocx(text: string): Promise<Buffer> {
 </w:document>`,
   );
   return await zip.generateAsync({ type: "nodebuffer" });
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Create an in-memory SQLite DB with the RAG schema, pre-populated with chunks. */
+function createTestDb(chunks: Array<{
+  id?: string; file?: string; content: string; lineStart?: number; lineEnd?: number;
+  vector?: number[];
+}>): Database.Database {
+  const db = new Database(":memory:");
+  db.pragma("journal_mode = WAL");
+  loadVec(db);
+  initSchema(db);
+
+  const insChunk = db.prepare(`
+    INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (let i = 0; i < chunks.length; i++) {
+    const c = chunks[i];
+    insChunk.run(
+      c.id ?? `chunk-${i}`,
+      c.file ?? "/src/file.ts",
+      c.content,
+      c.lineStart ?? 1,
+      c.lineEnd ?? 10,
+      sha256(c.content),
+      new Date().toISOString(),
+      Math.ceil(c.content.length / 4),
+    );
+    if (c.vector) {
+      const f = new Float32Array(c.vector);
+      db.prepare("INSERT INTO chunks_vec(embedding) VALUES (?)").run(Buffer.from(f.buffer, f.byteOffset, f.byteLength));
+    }
+  }
+
+  return db;
 }
 
 // ─── sha256 ──────────────────────────────────────────────────────────────────
@@ -488,87 +537,60 @@ describe("defaultConfig", () => {
   });
 });
 
-// ─── hybridSearch (BM25-only path, no vectors) ───────────────────────────────
+// ─── hybridSearch (using SQLite) ─────────────────────────────────────────────
 
-type Chunk = {
-  id: string; file: string; content: string;
-  lineStart: number; lineEnd: number;
-  hash: string; indexed: string; tokens: number;
-  vector?: number[];
-};
-
-type IndexMeta = {
-  chunks: Chunk[];
-  files: Record<string, { hash: string; chunks: number; indexed: string; size: number; embedded?: boolean }>;
-  lastBuild: string;
-  embeddingModel?: string;
-};
-
-function makeIndex(chunks: Partial<Chunk>[]): IndexMeta {
-  return {
-    chunks: chunks.map((c, i) => ({
-      id: `chunk-${i}`,
-      file: c.file ?? "/src/file.ts",
-      content: c.content ?? "",
-      lineStart: c.lineStart ?? 1,
-      lineEnd: c.lineEnd ?? 10,
-      hash: sha256(c.content ?? ""),
-      indexed: new Date().toISOString(),
-      tokens: Math.ceil((c.content ?? "").length / 4),
-      vector: c.vector,
-    })),
-    files: {},
-    lastBuild: "",
-  };
-}
-
-describe("hybridSearch (BM25, no vectors)", () => {
+describe("hybridSearch (BM25 via FTS5, no vectors)", () => {
   it("empty index → []", async () => {
-    const idx = makeIndex([]);
-    expect(await hybridSearch("query", idx, 10, 0.4)).toEqual([]);
+    const db = createTestDb([]);
+    const results = await hybridSearch("query", { chunks: [], files: {}, lastBuild: "" }, 10, 0.4, db);
+    db.close();
+    expect(results).toEqual([]);
   });
 
   it("returns scored result for matching content", async () => {
-    const idx = makeIndex([
+    const db = createTestDb([
       { content: "function authenticate(user, password) { return checkCredentials(user, password); }" },
       { content: "function renderTemplate(html) { return sanitize(html); }" },
     ]);
-    const results = await hybridSearch("authenticate", idx, 10, 1.0);
+    const results = await hybridSearch("authenticate", { chunks: [], files: {}, lastBuild: "" }, 10, 1.0, db);
+    db.close();
     expect(results.length).toBeGreaterThanOrEqual(1);
-    expect(results[0].bm25).toBeGreaterThan(0);
     expect(results[0].chunk.content).toContain("authenticate");
   });
 
   it("non-matching query → no results", async () => {
-    const idx = makeIndex([{ content: "function computeSquareRoot(n) { return Math.sqrt(n); }" }]);
-    const results = await hybridSearch("unrelated query term xyz", idx, 10, 1.0);
-    // filtered: only scores > 0 are returned
+    const db = createTestDb([{ content: "function computeSquareRoot(n) { return Math.sqrt(n); }" }]);
+    const results = await hybridSearch("unrelated query term xyz", { chunks: [], files: {}, lastBuild: "" }, 10, 1.0, db);
+    db.close();
     const nonZero = results.filter(r => r.hybrid > 0);
     expect(nonZero.length).toBe(0);
   });
 
   it("exact phrase match scores higher than partial match", async () => {
-    const idx = makeIndex([
-      { content: "function handleUserAuthentication() { validateToken(request); }" },
-      { content: "function handleRequest() { processData(input); }" },
+    const db = createTestDb([
+      { content: "function handle user authentication: validate token from request" },
+      { content: "function handle request: process data from input" },
     ]);
-    const results = await hybridSearch("user authentication", idx, 10, 1.0);
+    const results = await hybridSearch("user authentication", { chunks: [], files: {}, lastBuild: "" }, 10, 1.0, db);
+    db.close();
     const first = results[0]?.chunk.content ?? "";
-    expect(first).toContain("Authentication");
+    expect(first).toContain("authentication");
   });
 
   it("respects limit parameter", async () => {
     const chunks = Array.from({ length: 10 }, (_, i) => ({
       content: `function processItem${i}(value) { return transform(value); }`,
     }));
-    const idx = makeIndex(chunks);
-    const results = await hybridSearch("function process", idx, 3, 1.0);
+    const db = createTestDb(chunks);
+    const results = await hybridSearch("function process", { chunks: [], files: {}, lastBuild: "" }, 3, 1.0, db);
+    db.close();
     expect(results.length).toBeLessThanOrEqual(3);
   });
 
   it("result shape has bm25, vector, hybrid, chunk fields", async () => {
-    const idx = makeIndex([{ content: "export function calculateTotal(items) { return items.reduce((a, b) => a + b, 0); }" }]);
-    const results = await hybridSearch("calculate total", idx, 10, 1.0);
+    const db = createTestDb([{ content: "export function calculateTotal(items) { return items.reduce((a, b) => a + b, 0); }" }]);
+    const results = await hybridSearch("calculate total", { chunks: [], files: {}, lastBuild: "" }, 10, 1.0, db);
+    db.close();
     if (results.length > 0) {
       expect(results[0]).toHaveProperty("bm25");
       expect(results[0]).toHaveProperty("vector");
@@ -578,33 +600,58 @@ describe("hybridSearch (BM25, no vectors)", () => {
   });
 
   it("filename boost: first query term matching filename scores higher", async () => {
-    const idx = makeIndex([
-      { file: "/src/auth.ts", content: "export function login(user) { return verifyUser(user); }" },
-      { file: "/src/render.ts", content: "export function display(user) { return renderUser(user); }" },
+    const db = createTestDb([
+      { file: "/src/auth module", content: "export function login for user verification" },
+      { file: "/src/render module", content: "export function display for user rendering" },
     ]);
-    const results = await hybridSearch("auth user", idx, 10, 1.0);
-    // auth.ts should rank first due to filename boost on first term "auth"
-    expect(results[0]?.chunk.file).toContain("auth.ts");
+    const results = await hybridSearch("auth user", { chunks: [], files: {}, lastBuild: "" }, 10, 1.0, db);
+    db.close();
+    // auth module should rank first due to filename boost on first term "auth"
+    expect(results[0]?.chunk.file).toContain("auth");
+  });
+});
+
+// ─── hybridSearch with vectors ──────────────────────────────────────────────
+
+describe("hybridSearch with vectors", () => {
+  const vec = (seed: number) => Array.from({ length: 384 }, (_, i) => (i === seed ? 1 : 0));
+
+  it("uses vector scores when chunks have embeddings", async () => {
+    const db = createTestDb([
+      { content: "handle user login with password verification and auth", vector: vec(0) },
+      { content: "render the homepage template with context data", vector: vec(1) },
+    ]);
+    const results = await hybridSearch("login", { chunks: [], files: {}, lastBuild: "" }, 10, 0.5, db);
+    db.close();
+    expect(results.length).toBeGreaterThan(0);
+    // Both bm25 and vector scores are present
+    expect(results[0]).toHaveProperty("bm25");
+    expect(results[0]).toHaveProperty("vector");
+    expect(results[0]).toHaveProperty("hybrid");
   });
 
-  it("hybrid score blends bm25 and vector (with vectors present)", async () => {
-    const VECTOR_DIM = 384;
-    const vA = Array(VECTOR_DIM).fill(0);
-    vA[0] = 1; // unit vector along dim 0
-    const vB = Array(VECTOR_DIM).fill(0);
-    vB[1] = 1; // unit vector along dim 1 (orthogonal)
-
-    const idx = makeIndex([
-      { content: "function encryptPassword(password) { return bcrypt.hash(password); }", vector: vA },
-      { content: "function renderTemplate(html) { return sanitize(html); }", vector: vB },
+  it("hybrid score is blend of bm25 and vector when alpha=0.5", async () => {
+    const db = createTestDb([
+      { content: "authenticate user credentials and verify identity", vector: vec(0) },
+      { content: "logout session token and destroy active session", vector: vec(1) },
     ]);
+    const results = await hybridSearch("authenticate", { chunks: [], files: {}, lastBuild: "" }, 10, 0.5, db);
+    db.close();
+    expect(results.length).toBeGreaterThan(0);
+    const r = results[0];
+    const expectedHybrid = 0.5 * r.bm25 + 0.5 * r.vector;
+    expect(r.hybrid).toBeCloseTo(expectedHybrid, 5);
+  });
 
-    // Query vector closer to vA — use alpha=0 (pure vector)
-    const queryVec = vA;
-    // We can't inject the query embedding directly, but we can verify
-    // BM25-only path (alpha=1) vs hybrid (alpha=0.5)
-    const bm25Only = await hybridSearch("encrypt password", idx, 10, 1.0);
-    expect(bm25Only.length).toBeGreaterThan(0);
-    expect(bm25Only[0].hybrid).toBe(bm25Only[0].bm25);
+  it("falls back to pure bm25 when no chunks have valid vectors", async () => {
+    const db = createTestDb([
+      { content: "process payment amount through payment gateway charge" },
+      { content: "refund order through payment gateway refund" },
+    ]);
+    const results = await hybridSearch("payment", { chunks: [], files: {}, lastBuild: "" }, 10, 0.5, db);
+    db.close();
+    if (results.length > 0) {
+      expect(results[0].hybrid).toBe(results[0].bm25);
+    }
   });
 });

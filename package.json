@@ -1,7 +1,7 @@
 {
   "name": "pi-local-rag",
-  "version": "0.3.0",
-  "description": "Hybrid RAG pipeline for the Pi coding agent. BM25 + local vector embeddings (Transformers.js) + auto-injection into LLM context. Zero cloud dependency.",
+  "version": "0.4.0",
+  "description": "Hybrid RAG pipeline for the Pi coding agent. SQLite FTS5 (BM25) + sqlite-vec (vector) + auto-injection into LLM context. Zero cloud dependency.",
   "type": "module",
   "main": "./index.ts",
   "exports": {
@@ -57,10 +57,13 @@
     ]
   },
   "dependencies": {
+    "@sinclair/typebox": "^0.34.49",
     "@xenova/transformers": "^2.17.2",
+    "better-sqlite3": "^12.10.0",
     "ignore": "^7.0.0",
     "mammoth": "^1.8.0",
-    "pdf-parse": "^1.1.1"
+    "pdf-parse": "^1.1.1",
+    "sqlite-vec": "^0.1.9"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.60.0",
