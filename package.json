@@ -14,7 +14,10 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "npx --yes -p typescript@5.7.3 tsc -p tsconfig.json --noCheck"
+    "build": "npx --yes -p typescript@5.7.3 tsc -p tsconfig.json --noCheck",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest"
   },
   "keywords": [
     "pi-package",
@@ -54,10 +57,18 @@
     ]
   },
   "dependencies": {
-    "@xenova/transformers": "^2.0.1"
+    "@xenova/transformers": "^2.17.2",
+    "ignore": "^7.0.0",
+    "mammoth": "^1.8.0",
+    "pdf-parse": "^1.1.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.60.0",
     "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^4.1.4",
+    "jszip": "^3.10.1",
+    "vitest": "^4.1.4"
   }
 }

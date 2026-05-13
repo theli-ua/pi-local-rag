@@ -4,6 +4,10 @@
  * Index local files → chunk → embed → store → retrieve → inject into LLM context.
  * Uses Transformers.js (ONNX) for local embeddings — zero cloud dependency.
  *
+ * Storage is per-cwd: walk up from the working directory looking for a `.pi/rag/`
+ * project store; fall back to `~/.pi/rag/` as the global default. The first
+ * `/rag index` in a directory with no parent store creates one at cwd.
+ *
  * /rag index <path>     → index + embed a file or directory
  * /rag search <query>   → hybrid search (BM25 + vector)
  * /rag status           → show index stats
@@ -17,16 +21,15 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, renameSync } from "node:fs";
-import { join, extname, basename } from "node:path";
+import { join, extname, basename, resolve, relative, dirname } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
+import ignore from "ignore";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const RAG_DIR = join(homedir(), ".pi", "rag");
 const LEGACY_DIR = join(homedir(), ".pi", "lens"); // renamed from lens → rag
-const INDEX_FILE = join(RAG_DIR, "index.json");
-const CONFIG_FILE = join(RAG_DIR, "config.json");
+const GLOBAL_RAG_DIR = () => join(homedir(), ".pi", "rag");
 
 const RST = "\x1b[0m", B = "\x1b[1m", D = "\x1b[2m";
 const GREEN = "\x1b[32m", YELLOW = "\x1b[33m", CYAN = "\x1b[36m", RED = "\x1b[31m", MAGENTA = "\x1b[35m";
@@ -39,6 +42,11 @@ const TEXT_EXTS = new Set([
   ".css", ".html", ".json", ".yaml", ".yml", ".toml", ".xml", ".csv", ".sh",
   ".sql", ".graphql", ".proto", ".env", ".gitignore", ".dockerfile",
 ]);
+
+const BINARY_DOC_EXTS = new Set([".pdf", ".docx"]);
+
+const TEXT_MAX_BYTES = 500_000;
+const BINARY_DOC_MAX_BYTES = 10_000_000;
 
 const SKIP_DIRS = new Set([
   "node_modules", ".git", ".next", "dist", "build", "__pycache__", ".venv", "venv", ".cache",
@@ -70,51 +78,98 @@ interface RagConfig {
   ragTopK: number;
   ragScoreThreshold: number;
   ragAlpha: number; // 0 = pure vector, 1 = pure BM25
+  trackedPaths: string[];      // absolute paths previously passed to /rag index
+  excludePatterns: string[];   // gitignore-style patterns
 }
 
 type RagCommandCtx = Parameters<NonNullable<Parameters<ExtensionAPI["registerCommand"]>[0]["handler"]>>[1];
 
+// ─── Store resolution ────────────────────────────────────────────────────────
+
+/**
+ * Resolve the active RAG store directory for the current cwd.
+ *
+ * 1. `$PI_RAG_DIR` — explicit override, wins over everything.
+ * 2. Walk upward from `process.cwd()` looking for an existing `.pi/rag/`,
+ *    stopping before `homedir()` so the global store at `~/.pi/rag/` is only
+ *    reached as an explicit fallback (not via walk-up).
+ * 3. With `createIfMissing`, create `${cwd}/.pi/rag/`.
+ * 4. Otherwise, fall back to `${homedir()}/.pi/rag/`.
+ */
+export function getRagDir(opts: { createIfMissing?: boolean } = {}): string {
+  const override = process.env.PI_RAG_DIR;
+  if (override) {
+    if (!existsSync(override)) mkdirSync(override, { recursive: true });
+    return override;
+  }
+  const home = homedir();
+  let dir = process.cwd();
+  // Walk-up search, stopping before $HOME.
+  while (true) {
+    if (dir === home) break;
+    const candidate = join(dir, ".pi", "rag");
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir) break; // reached filesystem root
+    dir = parent;
+  }
+  if (opts.createIfMissing) {
+    const local = join(process.cwd(), ".pi", "rag");
+    mkdirSync(local, { recursive: true });
+    return local;
+  }
+  // Fallback: home-dir global. ensureDir handles creation + lens→rag migration.
+  const global = GLOBAL_RAG_DIR();
+  ensureDir(global);
+  return global;
+}
+
+function indexFile(ragDir: string): string { return join(ragDir, "index.json"); }
+function configFile(ragDir: string): string { return join(ragDir, "config.json"); }
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-function loadConfig(): RagConfig {
-  ensureDir();
-  if (!existsSync(CONFIG_FILE)) return defaultConfig();
+export function loadConfig(): RagConfig {
+  const ragDir = getRagDir();
+  const cfgFile = configFile(ragDir);
+  if (!existsSync(cfgFile)) return defaultConfig();
   try {
-    return { ...defaultConfig(), ...JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) };
+    return { ...defaultConfig(), ...JSON.parse(readFileSync(cfgFile, "utf-8")) };
   } catch { return defaultConfig(); }
 }
 
-function defaultConfig(): RagConfig {
-  return { ragEnabled: true, ragTopK: 5, ragScoreThreshold: 0.1, ragAlpha: 0.4 };
+export function defaultConfig(): RagConfig {
+  return {
+    ragEnabled: true, ragTopK: 5, ragScoreThreshold: 0.1, ragAlpha: 0.4,
+    trackedPaths: [], excludePatterns: [],
+  };
 }
 
-function saveConfig(config: RagConfig) {
-  ensureDir();
-  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+export function saveConfig(config: RagConfig) {
+  const ragDir = getRagDir();
+  writeFileSync(configFile(ragDir), JSON.stringify(config, null, 2));
 }
 
 // ─── Index I/O ───────────────────────────────────────────────────────────────
 
-function ensureDir() {
-  if (!existsSync(RAG_DIR)) {
-    // Migrate legacy .pi/lens directory to .pi/rag on first run
-    if (existsSync(LEGACY_DIR)) {
-      try {
-        renameSync(LEGACY_DIR, RAG_DIR);
-      } catch {
-        mkdirSync(RAG_DIR, { recursive: true });
-      }
-    } else {
-      mkdirSync(RAG_DIR, { recursive: true });
-    }
+function ensureDir(ragDir: string) {
+  if (existsSync(ragDir)) return;
+  // Lens→rag migration only applies at the home-dir global store.
+  if (ragDir === GLOBAL_RAG_DIR() && existsSync(LEGACY_DIR)) {
+    try {
+      renameSync(LEGACY_DIR, ragDir);
+      return;
+    } catch { /* fall through to mkdir */ }
   }
+  mkdirSync(ragDir, { recursive: true });
 }
 
 function loadIndex(): IndexMeta {
-  ensureDir();
-  if (!existsSync(INDEX_FILE)) return { chunks: [], files: {}, lastBuild: "" };
+  const ragDir = getRagDir();
+  const idxFile = indexFile(ragDir);
+  if (!existsSync(idxFile)) return { chunks: [], files: {}, lastBuild: "" };
   try {
-    const data = JSON.parse(readFileSync(INDEX_FILE, "utf-8"));
+    const data = JSON.parse(readFileSync(idxFile, "utf-8"));
     return {
       chunks: Array.isArray(data.chunks) ? data.chunks : [],
       files: data.files && typeof data.files === "object" ? data.files : {},
@@ -125,11 +180,11 @@ function loadIndex(): IndexMeta {
 }
 
 function saveIndex(index: IndexMeta) {
-  ensureDir();
-  writeFileSync(INDEX_FILE, JSON.stringify(index, null, 2));
+  const ragDir = getRagDir();
+  writeFileSync(indexFile(ragDir), JSON.stringify(index, null, 2));
 }
 
-function sha256(data: string): string {
+export function sha256(data: string): string {
   return createHash("sha256").update(data).digest("hex").slice(0, 12);
 }
 
@@ -150,7 +205,7 @@ async function embed(text: string): Promise<number[]> {
   return Array.from(output.data as Float32Array);
 }
 
-async function embedBatch(texts: string[], onProgress?: (i: number, total: number) => void): Promise<number[][]> {
+export async function embedBatch(texts: string[], onProgress?: (i: number, total: number) => void): Promise<number[][]> {
   const results: number[][] = [];
   for (let i = 0; i < texts.length; i++) {
     try {
@@ -166,7 +221,7 @@ async function embedBatch(texts: string[], onProgress?: (i: number, total: numbe
 
 // ─── Math ────────────────────────────────────────────────────────────────────
 
-function cosineSimilarity(a: number[], b: number[]): number {
+export function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length !== b.length) return 0;
   let dot = 0, normA = 0, normB = 0;
   for (let i = 0; i < a.length; i++) {
@@ -178,7 +233,7 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return denom === 0 ? 0 : dot / denom;
 }
 
-function normalize(scores: number[]): number[] {
+export function normalize(scores: number[]): number[] {
   const max = Math.max(...scores);
   const min = Math.min(...scores);
   const range = max - min;
@@ -188,7 +243,7 @@ function normalize(scores: number[]): number[] {
 
 // ─── Chunking & File Collection ──────────────────────────────────────────────
 
-function chunkText(text: string, maxLines = 50): { content: string; lineStart: number; lineEnd: number }[] {
+export function chunkText(text: string, maxLines = 50): { content: string; lineStart: number; lineEnd: number }[] {
   const lines = text.split("\n");
   const chunks: { content: string; lineStart: number; lineEnd: number }[] = [];
   let i = 0;
@@ -206,34 +261,125 @@ function chunkText(text: string, maxLines = 50): { content: string; lineStart: n
   return chunks;
 }
 
-function collectFiles(dirPath: string): string[] {
+export function collectFiles(dirPath: string, excludePatterns: string[] = []): string[] {
+  const ig = excludePatterns.length ? ignore().add(excludePatterns) : null;
   const files: string[] = [];
+
+  function isExcluded(absPath: string, root: string): boolean {
+    if (!ig) return false;
+    const rel = relative(root, absPath);
+    if (!rel || rel.startsWith("..")) return false;
+    return ig.ignores(rel);
+  }
+
+  function acceptable(fp: string, size: number): boolean {
+    const ext = extname(fp).toLowerCase();
+    if (TEXT_EXTS.has(ext)) return size < TEXT_MAX_BYTES;
+    if (BINARY_DOC_EXTS.has(ext)) return size < BINARY_DOC_MAX_BYTES;
+    return false;
+  }
+
+  try {
+    const stat = statSync(dirPath);
+    if (stat.isFile()) {
+      if (!acceptable(dirPath, stat.size)) return [];
+      if (ig && ig.ignores(basename(dirPath))) return [];
+      return [dirPath];
+    }
+  } catch { return []; }
+
+  const root = dirPath;
   function walk(dir: string) {
     try {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const fp = join(dir, entry.name);
         if (entry.isDirectory()) {
-          if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith(".")) walk(join(dir, entry.name));
-        } else if (TEXT_EXTS.has(extname(entry.name).toLowerCase())) {
-          const fp = join(dir, entry.name);
+          if (SKIP_DIRS.has(entry.name) || entry.name.startsWith(".")) continue;
+          if (isExcluded(fp, root)) continue;
+          walk(fp);
+        } else {
+          const ext = extname(entry.name).toLowerCase();
+          if (!TEXT_EXTS.has(ext) && !BINARY_DOC_EXTS.has(ext)) continue;
+          if (isExcluded(fp, root)) continue;
           try {
-            if (statSync(fp).size < 500_000) files.push(fp);
+            if (acceptable(fp, statSync(fp).size)) files.push(fp);
           } catch {}
         }
       }
     } catch {}
   }
-  try {
-    const stat = statSync(dirPath);
-    if (stat.isFile()) {
-      if (!TEXT_EXTS.has(extname(dirPath).toLowerCase()) || stat.size >= 500_000) return [];
-      return [dirPath];
-    }
-  } catch { return []; }
-  walk(dirPath);
+  walk(root);
   return files;
 }
 
+export function collectFromTracked(cfg: RagConfig): string[] {
+  const out = new Set<string>();
+  for (const p of cfg.trackedPaths) {
+    if (!existsSync(p)) continue;
+    for (const f of collectFiles(p, cfg.excludePatterns)) out.add(f);
+  }
+  return [...out];
+}
+
+/** Returns true if `file` is matched by `excludePatterns` relative to any of `roots`. */
+export function isExcludedByConfig(file: string, roots: string[], excludePatterns: string[]): boolean {
+  if (!excludePatterns.length) return false;
+  const ig = ignore().add(excludePatterns);
+  for (const root of roots) {
+    const rel = relative(root, file);
+    if (!rel || rel.startsWith("..")) continue;
+    if (ig.ignores(rel)) return true;
+  }
+  return false;
+}
+
 // ─── Indexing ─────────────────────────────────────────────────────────────────
+
+/**
+ * Read and decode a file into UTF-8 text. PDF and DOCX are routed through
+ * extraction libraries; everything else is read as plain UTF-8. Hash is
+ * computed over the raw bytes for binaries (so the source file's identity
+ * drives skip-on-rebuild) and over the decoded text for plain text files.
+ */
+// pdfjs (bundled inside pdf-parse) routes warnings through console.log with a
+// "Warning: " prefix. On real-world PDFs this fires thousands of times per
+// document ("Ran out of space in font private use area", missing glyphs, …).
+// The font warnings come from pdf.worker.js, which is a separate webpack
+// bundle whose verbosity is not externally configurable (its setVerbosityLevel
+// export exists only as a placeholder at the outer module level). Filtering
+// console.log for the known pdfjs prefixes is the only reliable approach.
+const PDFJS_LOG_PREFIX = /^(Warning|Info|Deprecated API usage):/;
+async function withPdfjsSilenced<T>(fn: () => Promise<T>): Promise<T> {
+  const origLog = console.log;
+  console.log = (...args: unknown[]) => {
+    const first = args[0];
+    if (typeof first === "string" && PDFJS_LOG_PREFIX.test(first)) return;
+    origLog(...args);
+  };
+  try {
+    return await fn();
+  } finally {
+    console.log = origLog;
+  }
+}
+
+export async function extractText(fp: string): Promise<{ text: string; hash: string; size: number }> {
+  const ext = extname(fp).toLowerCase();
+  if (ext === ".pdf") {
+    const buf = readFileSync(fp);
+    const { default: pdf } = await import("pdf-parse/lib/pdf-parse.js");
+    const data = await withPdfjsSilenced(() => pdf(buf));
+    return { text: data.text, hash: sha256(buf.toString("binary")), size: buf.length };
+  }
+  if (ext === ".docx") {
+    const buf = readFileSync(fp);
+    const { default: mammoth } = await import("mammoth");
+    const { value } = await mammoth.extractRawText({ buffer: buf });
+    return { text: value, hash: sha256(buf.toString("binary")), size: buf.length };
+  }
+  const text = readFileSync(fp, "utf-8");
+  return { text, hash: sha256(text), size: text.length };
+}
 
 interface ProgressCallbacks {
   onFile?: (current: number, total: number, filename: string, skipped: number) => void;
@@ -249,7 +395,7 @@ function stderrProgress(msg: string) {
   process.stderr.write(`\r\x1b[2K${msg}`);
 }
 
-async function indexFiles(
+export async function indexFiles(
   paths: string[],
   progress?: ProgressCallbacks
 ): Promise<{ indexed: number; chunks: number; skipped: number; durationMs: number }> {
@@ -264,8 +410,7 @@ async function indexFiles(
     const name = basename(fp);
 
     try {
-      const content = readFileSync(fp, "utf-8");
-      const hash = sha256(content);
+      const { text: content, hash, size } = await extractText(fp);
 
       if (index.files[fp]?.hash === hash && index.files[fp]?.embedded) {
         skipped++;
@@ -306,7 +451,7 @@ async function indexFiles(
         chunked++;
       }
 
-      index.files[fp] = { hash, chunks: rawChunks.length, indexed: new Date().toISOString(), size: content.length, embedded: true };
+      index.files[fp] = { hash, chunks: rawChunks.length, indexed: new Date().toISOString(), size, embedded: true };
       indexed++;
     } catch (err) { skipped++; stderrProgress(`[${i + 1}/${total}] ERROR ${name}: ${err instanceof Error ? err.message : String(err)}`); }
   }
@@ -321,6 +466,13 @@ async function indexFiles(
   return { indexed, chunks: chunked, skipped, durationMs: Date.now() - startMs };
 }
 
+// ─── Staleness ───────────────────────────────────────────────────────────────
+
+export function isIndexStale(index: IndexMeta, maxAgeMs = 24 * 60 * 60 * 1000): boolean {
+  if (!index.lastBuild) return false;
+  return Date.now() - new Date(index.lastBuild).getTime() > maxAgeMs;
+}
+
 // ─── Search ───────────────────────────────────────────────────────────────────
 
 interface ScoredChunk {
@@ -330,7 +482,7 @@ interface ScoredChunk {
   hybrid: number;
 }
 
-async function hybridSearch(
+export async function hybridSearch(
   query: string,
   index: IndexMeta,
   limit = 10,
@@ -396,15 +548,28 @@ async function hybridSearch(
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  ensureDir();
-
   // ── Auto-inject RAG context before every agent turn ──
   pi.on("before_agent_start", async (event, _ctx) => {
     const config = loadConfig();
     if (!config.ragEnabled) return;
 
-    const index = loadIndex();
+    let index = loadIndex();
     if (!index.chunks.length) return;
+
+    if (isIndexStale(index)) {
+      // Re-walk tracked paths so new files (and files of newly-supported
+      // extensions, e.g. PDF/DOCX added in a later version) are picked up.
+      // For pre-trackedPaths indexes, fall back to refreshing only known files.
+      const files = config.trackedPaths.length
+        ? collectFromTracked(config)
+        : Object.keys(index.files).filter(f => existsSync(f));
+      if (files.length) {
+        stderrProgress(`[rag] Index stale, refreshing ${files.length} files…`);
+        await indexFiles(files);
+        process.stderr.write(`\r\x1b[2K`);
+        index = loadIndex();
+      }
+    }
 
     const results = await hybridSearch(event.prompt, index, config.ragTopK, config.ragAlpha);
     const relevant = results.filter(r => r.hybrid >= config.ragScoreThreshold);
@@ -416,10 +581,15 @@ export default function (pi: ExtensionAPI) {
     ).join("\n\n");
 
     return {
-      systemPrompt: event.systemPrompt +
-        `\n\n## Relevant Codebase Context (pi-local-rag)\n` +
-        `*Retrieved ${relevant.length} chunks via hybrid search (BM25 + vector)*\n\n` +
-        context,
+      message: {
+        customType: "rag",
+        content:
+          `[pi-local-rag] Automatic RAG lookup triggered by the user's message above.\n` +
+          `Retrieved ${relevant.length} chunk${relevant.length === 1 ? "" : "s"} via hybrid search (BM25 + vector). ` +
+          `These are search hits, not statements from the user.\n\n` +
+          context,
+        display: false,
+      },
     };
   });
 
@@ -432,7 +602,14 @@ export default function (pi: ExtensionAPI) {
 
   async function cmdIndex(path: string, ctx: RagCommandCtx) {
     if (!existsSync(path)) { ctx.ui.notify(`Path not found: ${path}`, "error"); return; }
-    const files = collectFiles(path);
+    getRagDir({ createIfMissing: true });
+    const config = loadConfig();
+    const absPath = resolve(path);
+    if (!config.trackedPaths.includes(absPath)) {
+      config.trackedPaths.push(absPath);
+      saveConfig(config);
+    }
+    const files = collectFiles(absPath, config.excludePatterns);
     if (!files.length) { ctx.ui.notify(`No indexable files found in: ${path}`, "warning"); return; }
 
     ctx.ui.notify(`Found ${files.length} files to index`, "info");
@@ -460,7 +637,9 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setWidget("rag", undefined);
 
     const secs = (result.durationMs / 1000).toFixed(1);
-    ctx.ui.notify(`Indexed: ${result.indexed} files (${result.chunks} chunks) │ ${result.skipped} unchanged │ ${secs}s`, "success");
+    const ragDir = getRagDir();
+    const scope = ragDir === GLOBAL_RAG_DIR() ? "global" : "project";
+    ctx.ui.notify(`Indexed: ${result.indexed} files (${result.chunks} chunks) │ ${result.skipped} unchanged │ ${secs}s │ tracking ${config.trackedPaths.length} path(s) │ ${scope}`, "success");
   }
 
   async function cmdSearch(query: string, ctx: RagCommandCtx) {
@@ -495,23 +674,43 @@ export default function (pi: ExtensionAPI) {
 
   async function cmdRebuild(ctx: RagCommandCtx) {
     const index = loadIndex();
-    const allFiles = Object.keys(index.files);
-    if (!allFiles.length) { ctx.ui.notify("No files in index. Run /rag index <path> first.", "warning"); return; }
+    const config = loadConfig();
+    const indexedFiles = Object.keys(index.files);
+    const trackedFiles = collectFromTracked(config);
 
-    const existingFiles = allFiles.filter(f => existsSync(f));
-    const deletedFiles = allFiles.filter(f => !existsSync(f));
+    // Union of currently-indexed files and files discovered by walking tracked paths.
+    const targetSet = new Set<string>([...trackedFiles]);
+    for (const f of indexedFiles) {
+      if (existsSync(f) && !isExcludedByConfig(f, config.trackedPaths, config.excludePatterns)) {
+        targetSet.add(f);
+      }
+    }
+    const targetFiles = [...targetSet];
 
-    for (const f of deletedFiles) {
+    if (!targetFiles.length && !indexedFiles.length) {
+      ctx.ui.notify("No files to rebuild. Run /rag index <path> first.", "warning");
+      return;
+    }
+
+    // Files in the index but no longer present (deleted, excluded, or untracked).
+    const droppedFiles = indexedFiles.filter(f => !targetSet.has(f));
+    for (const f of droppedFiles) {
       index.chunks = index.chunks.filter(c => c.file !== f);
       delete index.files[f];
     }
-    for (const f of existingFiles) { if (index.files[f]) index.files[f].embedded = false; }
+
+    // Force re-embed all target files (treat new ones as not yet embedded).
+    for (const f of targetFiles) {
+      if (index.files[f]) index.files[f].embedded = false;
+    }
     saveIndex(index);
 
-    if (deletedFiles.length) ctx.ui.notify(`Pruned ${deletedFiles.length} deleted files`, "info");
-    ctx.ui.notify(`Rebuilding ${existingFiles.length} files...`, "info");
+    const newFiles = targetFiles.filter(f => !indexedFiles.includes(f));
+    if (droppedFiles.length) ctx.ui.notify(`Pruned ${droppedFiles.length} files (deleted/excluded)`, "info");
+    if (newFiles.length) ctx.ui.notify(`Discovered ${newFiles.length} new files`, "info");
+    ctx.ui.notify(`Rebuilding ${targetFiles.length} files...`, "info");
 
-    const result = await indexFiles(existingFiles, {
+    const result = await indexFiles(targetFiles, {
       onFile(current, total, filename, skipped) {
         const pct = Math.round((current / total) * 100);
         const bar = progressBar(current, total);
@@ -534,7 +733,7 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setWidget("rag", undefined);
 
     const secs = (result.durationMs / 1000).toFixed(1);
-    ctx.ui.notify(`Rebuilt: ${result.indexed} re-indexed │ ${result.skipped} unchanged │ ${deletedFiles.length} deleted │ ${result.chunks} chunks │ ${secs}s`, "success");
+    ctx.ui.notify(`Rebuilt: ${result.indexed} re-indexed │ ${result.skipped} unchanged │ ${droppedFiles.length} deleted │ ${result.chunks} chunks │ ${secs}s`, "success");
   }
 
   function cmdClear(ctx: RagCommandCtx) {
@@ -549,6 +748,8 @@ export default function (pi: ExtensionAPI) {
     const totalTokens = index.chunks.reduce((sum, c) => sum + c.tokens, 0);
     const embeddedCount = index.chunks.filter(c => c.vector).length;
     const vectorCoverage = index.chunks.length ? Math.round(embeddedCount / index.chunks.length * 100) : 0;
+    const ragDir = getRagDir();
+    const scope = ragDir === GLOBAL_RAG_DIR() ? "global" : "project";
 
     let md = `## 🔍 pi-local-rag Status\n\n`;
     md += `| Metric | Value |\n|---|---|\n`;
@@ -558,7 +759,7 @@ export default function (pi: ExtensionAPI) {
     md += `| Total tokens | ${totalTokens.toLocaleString()} |\n`;
     md += `| Embedding model | ${index.embeddingModel || "none"} |\n`;
     md += `| Last build | ${index.lastBuild || "never"} |\n`;
-    md += `| Storage | \`${RAG_DIR}\` |\n\n`;
+    md += `| Storage | \`${ragDir}\` (${scope}) |\n\n`;
     md += `**RAG injection:** ${config.ragEnabled ? "enabled ✅" : "disabled ⚠️"}  \n`;
     md += `\`topK=${config.ragTopK}\`  \`threshold=${config.ragScoreThreshold}\`  \`alpha=${config.ragAlpha}\`\n`;
 
@@ -570,22 +771,103 @@ export default function (pi: ExtensionAPI) {
         md += `- \`${ext}\`: ${count}\n`;
       }
     }
+
+    md += `\n### Tracked paths\n\n`;
+    if (config.trackedPaths.length) {
+      for (const p of config.trackedPaths) md += `- \`${p}\`\n`;
+    } else {
+      md += `*(none — run /rag index <path> to track)*\n`;
+    }
+
+    md += `\n### Exclude patterns\n\n`;
+    if (config.excludePatterns.length) {
+      for (const p of config.excludePatterns) md += `- \`${p}\`\n`;
+    } else {
+      md += `*(none — add with /rag exclude <pattern>)*\n`;
+    }
+
     pi.sendMessage({ customType: "rag-status", content: md, display: true });
+  }
+
+  function cmdExclude(expr: string, ctx: RagCommandCtx) {
+    const config = loadConfig();
+
+    if (!expr) {
+      if (!config.excludePatterns.length) {
+        ctx.ui.notify("No exclude patterns set. Add one with: /rag exclude <pattern>", "warning");
+        return;
+      }
+      let md = `## Exclude patterns (${config.excludePatterns.length})\n\n`;
+      for (const p of config.excludePatterns) md += `- \`${p}\`\n`;
+      pi.sendMessage({ customType: "rag", content: md, display: true });
+      return;
+    }
+
+    if (expr.startsWith("-")) {
+      const target = expr.slice(1);
+      const before = config.excludePatterns.length;
+      config.excludePatterns = config.excludePatterns.filter(p => p !== target);
+      if (config.excludePatterns.length === before) {
+        ctx.ui.notify(`Pattern not found: ${target}`, "warning");
+        return;
+      }
+      saveConfig(config);
+      ctx.ui.notify(`Removed exclude: ${target} (${config.excludePatterns.length} remain). Run /rag rebuild to re-apply.`, "success");
+      return;
+    }
+
+    if (config.excludePatterns.includes(expr)) {
+      ctx.ui.notify(`Already excluded: ${expr}`, "warning");
+      return;
+    }
+    config.excludePatterns.push(expr);
+    saveConfig(config);
+    ctx.ui.notify(`Added exclude: ${expr} (${config.excludePatterns.length} total). Run /rag rebuild to re-apply.`, "success");
+  }
+
+  function cmdFind(glob: string, ctx: RagCommandCtx) {
+    if (!glob) {
+      ctx.ui.notify("Usage: /rag find <glob>   e.g. *.html, page*, foo.js, src/*.ts", "warning");
+      return;
+    }
+
+    const index = loadIndex();
+    const cwd = process.cwd();
+    const ig = ignore().add([glob]);
+
+    const matches: string[] = [];
+    for (const fp of Object.keys(index.files)) {
+      const rel = relative(cwd, fp);
+      const candidate = rel && !rel.startsWith("..") ? rel : basename(fp);
+      if (ig.ignores(candidate)) matches.push(fp);
+    }
+    matches.sort();
+
+    if (!matches.length) {
+      ctx.ui.notify(`No indexed files match: ${glob}`, "warning");
+      return;
+    }
+
+    let md = `## 🔍 ${matches.length} indexed file${matches.length === 1 ? "" : "s"} matching "${glob}"\n\n`;
+    for (const fp of matches) md += `- \`${fp}\`\n`;
+    pi.sendMessage({ customType: "rag", content: md, display: true });
   }
 
   // ── /rag command ──
   const RAG_SUBCOMMANDS: { value: string; label: string; description: string }[] = [
     { value: "index", label: "index", description: "Index a file or directory" },
     { value: "search", label: "search", description: "Search the index" },
+    { value: "find", label: "find", description: "Find indexed files by glob" },
     { value: "status", label: "status", description: "Show index statistics" },
     { value: "rebuild", label: "rebuild", description: "Rebuild entire index" },
     { value: "clear", label: "clear", description: "Clear the index" },
+    { value: "exclude", label: "exclude", description: "Manage exclude patterns" },
     { value: "on", label: "on", description: "Enable auto-injection" },
     { value: "off", label: "off", description: "Disable auto-injection" },
   ];
 
   pi.registerCommand("rag", {
-    description: "pi-local-rag: /rag index|search|status|rebuild|clear|on|off",
+    description: "pi-local-rag: /rag index|search|find|status|rebuild|clear|exclude|on|off",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
       const filtered = RAG_SUBCOMMANDS
         .filter((s) => s.value.startsWith(prefix))
@@ -602,6 +884,12 @@ export default function (pi: ExtensionAPI) {
           break;
         case "search":
           await cmdSearch(parts.slice(1).join(" "), ctx);
+          break;
+        case "exclude":
+          cmdExclude(parts.slice(1).join(" ").trim(), ctx);
+          break;
+        case "find":
+          cmdFind(parts.slice(1).join(" ").trim(), ctx);
           break;
         case "on":
         case "off":
@@ -623,22 +911,31 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "rag_index",
-    description: "Index a file or directory into the local pi-local-rag pipeline. Chunks text files, generates embeddings, stores for hybrid BM25+vector search.",
+    label: "RAG index",
+    description: "Index a file or directory into the local pi-local-rag pipeline. Chunks text files (including PDF and DOCX), generates embeddings, stores for hybrid BM25+vector search.",
     parameters: Type.Object({
       path: Type.String({ description: "File or directory path to index" }),
     }),
     execute: async (_toolCallId, params) => {
-      if (!existsSync(params.path)) return { content: [{ type: "text" as const, text: `Path not found: ${params.path}` }] };
-      const files = collectFiles(params.path);
-      if (!files.length) return { content: [{ type: "text" as const, text: `No indexable text files found in: ${params.path}` }] };
+      if (!existsSync(params.path)) return { content: [{ type: "text" as const, text: `Path not found: ${params.path}` }], details: undefined };
+      getRagDir({ createIfMissing: true });
+      const config = loadConfig();
+      const absPath = resolve(params.path);
+      if (!config.trackedPaths.includes(absPath)) {
+        config.trackedPaths.push(absPath);
+        saveConfig(config);
+      }
+      const files = collectFiles(absPath, config.excludePatterns);
+      if (!files.length) return { content: [{ type: "text" as const, text: `No indexable files found in: ${params.path}` }], details: undefined };
       const result = await indexFiles(files, {});
       process.stderr.write(`\n`);
-      return { content: [{ type: "text" as const, text: `Indexed ${result.indexed} files (${result.chunks} chunks, embeddings generated). ${result.skipped} unchanged. ${(result.durationMs / 1000).toFixed(1)}s` }] };
+      return { content: [{ type: "text" as const, text: `Indexed ${result.indexed} files (${result.chunks} chunks, embeddings generated). ${result.skipped} unchanged. ${(result.durationMs / 1000).toFixed(1)}s` }], details: undefined };
     },
   });
 
   pi.registerTool({
     name: "rag_query",
+    label: "RAG query",
     description: "Search the local pi-local-rag index using hybrid BM25+vector search. Returns relevant chunks with file paths, line numbers, and relevance scores.",
     parameters: Type.Object({
       query: Type.String({ description: "Search query" }),
@@ -646,10 +943,10 @@ export default function (pi: ExtensionAPI) {
     }),
     execute: async (_toolCallId, params) => {
       const index = loadIndex();
-      if (!index.chunks.length) return { content: [{ type: "text" as const, text: "pi-local-rag index is empty. Run rag_index first." }] };
+      if (!index.chunks.length) return { content: [{ type: "text" as const, text: "pi-local-rag index is empty. Run rag_index first." }], details: undefined };
       const config = loadConfig();
       const results = await hybridSearch(params.query, index, params.limit ?? 10, config.ragAlpha);
-      if (!results.length) return { content: [{ type: "text" as const, text: `No results for: ${params.query}` }] };
+      if (!results.length) return { content: [{ type: "text" as const, text: `No results for: ${params.query}` }], details: undefined };
       const text = JSON.stringify(results.map(r => ({
         file: r.chunk.file,
         lines: `${r.chunk.lineStart}-${r.chunk.lineEnd}`,
@@ -657,12 +954,13 @@ export default function (pi: ExtensionAPI) {
         scores: { bm25: r.bm25.toFixed(3), vector: r.vector.toFixed(3), hybrid: r.hybrid.toFixed(3) },
         preview: r.chunk.content.slice(0, 300),
       })), null, 2);
-      return { content: [{ type: "text" as const, text }] };
+      return { content: [{ type: "text" as const, text }], details: undefined };
     },
   });
 
   pi.registerTool({
     name: "rag_status",
+    label: "RAG status",
     description: "Show pi-local-rag index statistics: file count, chunk count, vector coverage, embedding model, RAG config.",
     parameters: Type.Object({}),
     execute: async (_toolCallId) => {
@@ -678,9 +976,10 @@ export default function (pi: ExtensionAPI) {
         totalTokens: index.chunks.reduce((s, c) => s + c.tokens, 0),
         lastBuild: index.lastBuild || "never",
         ragConfig: config,
-        storagePath: RAG_DIR,
+        storagePath: getRagDir(),
+        storageScope: getRagDir() === GLOBAL_RAG_DIR() ? "global" : "project",
       }, null, 2);
-      return { content: [{ type: "text" as const, text }] };
+      return { content: [{ type: "text" as const, text }], details: undefined };
     },
   });
 }

@@ -44,13 +44,20 @@ The extension registers three tools the agent can call directly:
 
 ## How It Works
 
-1. **Index** — files are chunked (~50 lines each), embedded with `Xenova/all-MiniLM-L6-v2` (384-dim), and stored locally at `~/.pi/rag/`
+1. **Index** — files are chunked (~50 lines each), embedded with `Xenova/all-MiniLM-L6-v2` (384-dim), and stored in the active RAG store (see [Storage](#storage))
 2. **Search** — hybrid scoring: `alpha × BM25 + (1-alpha) × cosine_similarity` (default `alpha=0.4`)
 3. **Auto-inject** — before every agent turn, the prompt is searched and relevant chunks are prepended to the system prompt
 
 ## Storage
 
-Index data is stored at `~/.pi/rag/`. If you previously used an older version of this plugin (`~/.pi/lens/`), the directory is automatically migrated on first run.
+The plugin keeps each project's index and config in its own `.pi/rag/` directory. The active store is resolved per-cwd:
+
+1. `$PI_RAG_DIR` — explicit override, if set.
+2. **Walk-up** — climb upward from the working directory looking for an existing `.pi/rag/`. Walk-up stops *before* `$HOME`, so the global store never wins via walk-up.
+3. **Auto-create** — the first `/rag index` (or `rag_index` tool call) in a directory with no walk-up hit creates `./.pi/rag/` at the cwd. Other commands never auto-create.
+4. **Global fallback** — `~/.pi/rag/` is used when no project store is found.
+
+`/rag status` shows the active store's path and labels it `(project)` or `(global)`. If you previously used `~/.pi/lens/`, the directory is migrated to `~/.pi/rag/` on first run.
 
 ## Configuration
 
