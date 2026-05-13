@@ -153,7 +153,12 @@ async function embed(text: string): Promise<number[]> {
 async function embedBatch(texts: string[], onProgress?: (i: number, total: number) => void): Promise<number[][]> {
   const results: number[][] = [];
   for (let i = 0; i < texts.length; i++) {
-    results.push(await embed(texts[i]));
+    try {
+      results.push(await embed(texts[i]));
+    } catch (err) {
+      process.stderr.write(`\n[embedBatch ERROR] chunk ${i + 1}/${texts.length}: ${err instanceof Error ? err.message : String(err)}\n`);
+      throw err;
+    }
     onProgress?.(i + 1, texts.length);
   }
   return results;
@@ -303,7 +308,7 @@ async function indexFiles(
 
       index.files[fp] = { hash, chunks: rawChunks.length, indexed: new Date().toISOString(), size: content.length, embedded: true };
       indexed++;
-    } catch { skipped++; }
+    } catch (err) { skipped++; stderrProgress(`[${i + 1}/${total}] ERROR ${name}: ${err instanceof Error ? err.message : String(err)}`); }
   }
 
   // Clear stderr progress line
