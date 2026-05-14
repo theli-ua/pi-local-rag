@@ -80,9 +80,12 @@ function createTestDb(chunks: Array<{
     INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  const insVec = db.prepare(
+    "INSERT INTO chunks_vec(rowid, embedding) VALUES (CAST(? AS INTEGER), ?)",
+  );
   for (let i = 0; i < chunks.length; i++) {
     const c = chunks[i];
-    insChunk.run(
+    const result = insChunk.run(
       c.id ?? `chunk-${i}`,
       c.file ?? "/src/file.ts",
       c.content,
@@ -94,7 +97,7 @@ function createTestDb(chunks: Array<{
     );
     if (c.vector) {
       const f = new Float32Array(c.vector);
-      db.prepare("INSERT INTO chunks_vec(embedding) VALUES (?)").run(Buffer.from(f.buffer, f.byteOffset, f.byteLength));
+      insVec.run(Number(result.lastInsertRowid), Buffer.from(f.buffer, f.byteOffset, f.byteLength));
     }
   }
 
