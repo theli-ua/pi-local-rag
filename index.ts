@@ -411,16 +411,24 @@ async function embed(text: string): Promise<number[]> {
   return Array.from(output.data as Float32Array);
 }
 
+const EMBED_BATCH_SIZE = 64;
+
 export async function embedBatch(texts: string[], onProgress?: (i: number, total: number) => void): Promise<number[][]> {
+  const embedder = await getEmbedder();
   const results: number[][] = [];
-  for (let i = 0; i < texts.length; i++) {
+  for (let start = 0; start < texts.length; start += EMBED_BATCH_SIZE) {
+    const batch = texts.slice(start, start + EMBED_BATCH_SIZE);
     try {
-      results.push(await embed(texts[i]));
+      const output = await embedder(batch, { pooling: "mean", normalize: true, truncate: true });
+      for (let b = 0; b < batch.length; b++) {
+        results.push(Array.from(output[b].data as Float32Array));
+      }
     } catch (err) {
-      process.stderr.write(`\n[embedBatch ERROR] chunk ${i + 1}/${texts.length}: ${err instanceof Error ? err.message : String(err)}\n`);
+      process.stderr.write(`\n[embedBatch ERROR] batch ${start}/${texts.length}: ${err instanceof Error ? err.message : String(err)}\n`);
       throw err;
     }
-    onProgress?.(i + 1, texts.length);
+    const done = start + batch.length;
+    for (let b = 0; b < batch.length; b++) onProgress?.(done - batch.length + b + 1, texts.length);
   }
   return results;
 }
@@ -616,7 +624,6 @@ export async function indexFiles(
   const startMs = Date.now();
   const total = paths.length;
 
-  const getFile = database.prepare("SELECT hash, embedded FROM files WHERE path = ?").get.bind(database.prepare("SELECT hash, embedded FROM files WHERE path = ?").get);
   const delChunks = database.prepare("DELETE FROM chunks WHERE file_path = ?");
   const delVec = database.prepare("DELETE FROM chunks_vec WHERE rowid IN (SELECT rowid FROM chunks WHERE file_path = ?)");
   const delFile = database.prepare("DELETE FROM files WHERE path = ?");
