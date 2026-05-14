@@ -39,11 +39,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vahidkowsari/pi-local-rag.git"
+    "url": "git+https://github.com/theli-ua/pi-local-rag.git"
   },
-  "homepage": "https://github.com/vahidkowsari/pi-local-rag#readme",
+  "homepage": "https://github.com/theli-ua/pi-local-rag#readme",
   "bugs": {
-    "url": "https://github.com/vahidkowsari/pi-local-rag/issues"
+    "url": "https://github.com/theli-ua/pi-local-rag/issues"
   },
   "engines": {
     "node": ">=20"

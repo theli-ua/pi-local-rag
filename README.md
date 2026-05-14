@@ -1,5 +1,7 @@
 # pi-local-rag
 
+> **Fork** — This is a fork of the original [pi-local-rag](https://github.com/vahidkowsari/pi-local-rag) by @vahidkowsari.
+
 Local hybrid RAG pipeline for the [Pi coding agent](https://github.com/badlogic/pi-mono). Index your codebase and get fast semantic + keyword search — **zero cloud dependency, works fully offline**.
 
 Backed by **SQLite FTS5** (BM25) and **sqlite-vec** (vector search) for fast retrieval over large codebases.
@@ -19,13 +21,7 @@ Backed by **SQLite FTS5** (BM25) and **sqlite-vec** (vector search) for fast ret
 ## Install
 
 ```bash
-pi install npm:pi-local-rag
-```
-
-Or via git:
-
-```bash
-pi install git:github.com/vahidkowsari/pi-local-rag
+pi install git:github.com/theli-ua/pi-local-rag
 ```
 
 ## Commands
