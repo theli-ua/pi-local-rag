@@ -614,6 +614,14 @@ function stderrProgress(msg: string) {
   process.stderr.write(`\r\x1b[2K${msg}`);
 }
 
+interface _FileWork {
+  fp: string;
+  hash: string;
+  size: number;
+  rawChunks: { content: string; lineStart: number; lineEnd: number }[];
+  _vectors?: number[][]; // populated during embed phase
+}
+
 export async function indexFiles(
   paths: string[],
   progress?: ProgressCallbacks,
@@ -624,21 +632,12 @@ export async function indexFiles(
   const startMs = Date.now();
   const total = paths.length;
 
+  const getFile = database.prepare("SELECT hash, embedded FROM files WHERE path = ?").get;
   const delChunks = database.prepare("DELETE FROM chunks WHERE file_path = ?");
   const delVec = database.prepare("DELETE FROM chunks_vec WHERE rowid IN (SELECT rowid FROM chunks WHERE file_path = ?)");
-  const delFile = database.prepare("DELETE FROM files WHERE path = ?");
-  const insChunk = database.prepare(`
-    INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const upsertFile = database.prepare(`
-    INSERT INTO files(path, hash, chunks, indexed, size, embedded)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(path) DO UPDATE SET
-      hash=excluded.hash, chunks=excluded.chunks, indexed=excluded.indexed,
-      size=excluded.size, embedded=excluded.embedded
-  `);
 
+  // ── Phase 1: read + chunk all files; skip unchanged ──
+  const toIndex: _FileWork[] = [];
   for (let i = 0; i < paths.length; i++) {
     const fp = paths[i];
     const pct = Math.round(((i + 1) / total) * 100);
@@ -647,7 +646,7 @@ export async function indexFiles(
     try {
       const { text: content, hash, size } = await extractText(fp);
 
-      const existing = database.prepare("SELECT hash, embedded FROM files WHERE path = ?").get(fp) as { hash?: string; embedded?: number } | undefined;
+      const existing = getFile(fp) as { hash?: string; embedded?: number } | undefined;
       if (existing?.hash === hash && existing?.embedded) {
         skipped++;
         stderrProgress(`[${i + 1}/${total}] ${pct}% skipped ${name}`);
@@ -656,53 +655,93 @@ export async function indexFiles(
         continue;
       }
 
-      // Remove old chunks for this file
       delVec.run(fp);
       delChunks.run(fp);
 
       const rawChunks = chunkText(content);
-
-      stderrProgress(`[${i + 1}/${total}] ${pct}% embedding ${name} (${rawChunks.length} chunks)`);
+      stderrProgress(`[${i + 1}/${total}] ${pct}% chunked ${name} (${rawChunks.length} chunks)`);
       progress?.onFile?.(i + 1, total, name, skipped);
       await yield_();
 
-      const vectors = await embedBatch(
-        rawChunks.map(c => c.content),
-        (ci) => {
-          stderrProgress(`[${i + 1}/${total}] ${pct}% ${name} — chunk ${ci}/${rawChunks.length}`);
-          progress?.onChunk?.(ci, rawChunks.length, name);
-        }
-      );
-
-      const tx = database.transaction(() => {
-        const insVecRowid = database.prepare("INSERT INTO chunks_vec(rowid, embedding) VALUES (CAST(? AS INTEGER), ?)");
-        for (let j = 0; j < rawChunks.length; j++) {
-          const chunk = rawChunks[j];
-          // Insert chunk and capture rowid for vector alignment
-          const chunkResult = insChunk.run(
-            `${sha256(fp)}-${chunk.lineStart}`,
-            fp,
-            chunk.content,
-            chunk.lineStart,
-            chunk.lineEnd,
-            sha256(chunk.content),
-            new Date().toISOString(),
-            Math.ceil(chunk.content.length / 4),
-          );
-          // Insert vector with explicit rowid matching chunks.rowid
-          insVecRowid.run(Number(chunkResult.lastInsertRowid), float32ToBuffer(vectors[j]));
-          chunked++;
-        }
-        upsertFile.run(fp, hash, rawChunks.length, new Date().toISOString(), size, 1);
-      });
-
-      tx();
-      indexed++;
+      toIndex.push({ fp, hash, size, rawChunks });
     } catch (err) {
       skipped++;
       stderrProgress(`[${i + 1}/${total}] ERROR ${name}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+
+  // ── Phase 2: embed in cross-file groups (bounded memory) ──
+  // Collect chunks across files until we hit a group target, then embed.
+  // Keeps memory bounded for 100k+ files while still batching across files.
+  const EMBED_GROUP_TARGET = 256;
+  const groupChunks: { fw: _FileWork; ci: number }[] = [];
+  let globalChunkIdx = 0;
+
+  const flushGroup = async () => {
+    if (groupChunks.length === 0) return;
+    const texts = groupChunks.map(g => g.fw.rawChunks[g.ci].content);
+    const totalChunks = toIndex.reduce((s, f) => s + f.rawChunks.length, 0);
+    stderrProgress(`Embedding ${globalChunkIdx - groupChunks.length + 1}…${globalChunkIdx}/${totalChunks} chunks`);
+    await yield_();
+    const vectors = await embedBatch(texts);
+    // Store vectors on the _FileWork for DB insert phase
+    for (let vi = 0; vi < groupChunks.length; vi++) {
+      const g = groupChunks[vi];
+      g.fw._vectors ??= new Array(g.fw.rawChunks.length);
+      g.fw._vectors[g.ci] = vectors[vi];
+    }
+    groupChunks.length = 0;
+  };
+
+  for (const fw of toIndex) {
+    for (let j = 0; j < fw.rawChunks.length; j++) {
+      groupChunks.push({ fw, ci: j });
+      globalChunkIdx++;
+      if (groupChunks.length >= EMBED_GROUP_TARGET) await flushGroup();
+    }
+  }
+  await flushGroup(); // remaining
+
+  // ── Phase 3: insert chunks + vectors into DB ──
+  const insChunk = database.prepare(`
+    INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insVecRowid = database.prepare("INSERT INTO chunks_vec(rowid, embedding) VALUES (CAST(? AS INTEGER), ?)");
+  const upsertFile = database.prepare(`
+    INSERT INTO files(path, hash, chunks, indexed, size, embedded)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(path) DO UPDATE SET
+      hash=excluded.hash, chunks=excluded.chunks, indexed=excluded.indexed,
+      size=excluded.size, embedded=excluded.embedded
+  `);
+
+  const tx = database.transaction(() => {
+    for (const fw of toIndex) {
+      const vectors = fw._vectors;
+      for (let j = 0; j < fw.rawChunks.length; j++) {
+        const c = fw.rawChunks[j];
+        const chunkResult = insChunk.run(
+          `${sha256(fw.fp)}-${c.lineStart}`,
+          fw.fp,
+          c.content,
+          c.lineStart,
+          c.lineEnd,
+          sha256(c.content),
+          new Date().toISOString(),
+          Math.ceil(c.content.length / 4),
+        );
+        if (vectors?.[j]) {
+          insVecRowid.run(Number(chunkResult.lastInsertRowid), float32ToBuffer(vectors[j]));
+        }
+        chunked++;
+      }
+      upsertFile.run(fw.fp, fw.hash, fw.rawChunks.length, new Date().toISOString(), fw.size, 1);
+    }
+    indexed = toIndex.length;
+  });
+
+  tx();
 
   // Clear stderr progress line
   process.stderr.write(`\r\x1b[2K`);
