@@ -6,9 +6,12 @@ import { tmpdir } from "node:os";
 // Must be declared before the import so vitest hoists it above the module load.
 vi.mock("@xenova/transformers", () => ({
   pipeline: vi.fn().mockResolvedValue(
-    vi.fn().mockImplementation(async () => ({
-      data: new Float32Array(384).fill(0.1),
-    }))
+    vi.fn().mockImplementation(async (texts: string | string[]) => {
+      if (Array.isArray(texts)) {
+        return texts.map(() => ({ data: new Float32Array(384).fill(0.1) }));
+      }
+      return { data: new Float32Array(384).fill(0.1) };
+    })
   ),
 }));
 
