@@ -632,7 +632,6 @@ export async function indexFiles(
   const startMs = Date.now();
   const total = paths.length;
 
-  const getFile = database.prepare("SELECT hash, embedded FROM files WHERE path = ?").get;
   const delChunks = database.prepare("DELETE FROM chunks WHERE file_path = ?");
   const delVec = database.prepare("DELETE FROM chunks_vec WHERE rowid IN (SELECT rowid FROM chunks WHERE file_path = ?)");
 
@@ -646,7 +645,7 @@ export async function indexFiles(
     try {
       const { text: content, hash, size } = await extractText(fp);
 
-      const existing = getFile(fp) as { hash?: string; embedded?: number } | undefined;
+      const existing = database.prepare("SELECT hash, embedded FROM files WHERE path = ?").get(fp) as { hash?: string; embedded?: number } | undefined;
       if (existing?.hash === hash && existing?.embedded) {
         skipped++;
         stderrProgress(`[${i + 1}/${total}] ${pct}% skipped ${name}`);
