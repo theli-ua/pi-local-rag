@@ -611,8 +611,12 @@ const yield_ = () => new Promise<void>(r => setTimeout(r, 0));
 
 /** Write overwriting progress line to stderr (visible in terminal even during tool calls) */
 function stderrProgress(msg: string) {
+  if (_suppressStderr) return;
   process.stderr.write(`\r\x1b[2K${msg}`);
 }
+
+/** Whether stderr progress should be suppressed (e.g. when TUI callbacks handle display) */
+let _suppressStderr = false;
 
 interface _FileWork {
   fp: string;
@@ -627,10 +631,15 @@ export async function indexFiles(
   progress?: ProgressCallbacks,
   _db?: Database.Database
 ): Promise<{ indexed: number; chunks: number; skipped: number; durationMs: number }> {
+  // Suppress stderr progress when TUI callbacks handle display to avoid flashing
+  const hadCallbacks = !!progress;
+  if (hadCallbacks) _suppressStderr = true;
   const database = _db ?? openDb();
   let indexed = 0, chunked = 0, skipped = 0;
   const startMs = Date.now();
   const total = paths.length;
+
+  try {
 
   const delChunks = database.prepare("DELETE FROM chunks WHERE file_path = ?");
   const delVec = database.prepare("DELETE FROM chunks_vec WHERE rowid IN (SELECT rowid FROM chunks WHERE file_path = ?)");
@@ -743,13 +752,16 @@ export async function indexFiles(
   tx();
 
   // Clear stderr progress line
-  process.stderr.write(`\r\x1b[2K`);
+  if (!hadCallbacks) process.stderr.write(`\r\x1b[2K`);
 
   progress?.onSave?.();
   database.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('last_build', ?)").run(new Date().toISOString());
   database.prepare("INSERT OR REPLACE INTO metadata(key, value) VALUES ('embedding_model', ?)").run(EMBEDDING_MODEL);
 
   return { indexed, chunks: chunked, skipped, durationMs: Date.now() - startMs };
+  } finally {
+    if (hadCallbacks) _suppressStderr = false;
+  }
 }
 
 // ─── Staleness ───────────────────────────────────────────────────────────────
