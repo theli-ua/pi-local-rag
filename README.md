@@ -74,8 +74,9 @@ The index is stored as a **SQLite database** (`rag.db`) with:
 - `chunks_fts` — FTS5 virtual table for BM25 keyword search
 - `chunks_vec` — sqlite-vec virtual table for 384-dim vector similarity
 - `files` table — file-level hash tracking for incremental re-indexing
+- `metadata` table — key/value pairs (`last_build`, `embedding_model`)
 
-`/rag status` shows the active store's path and labels it `(project)` or `(global)`. Legacy `index.json` files are auto-migrated to SQLite on first run. If you previously used `~/.pi/lens/`, that directory is migrated to `~/.pi/rag/` on first run.
+Config is stored as JSON in `config.json`. `/rag status` shows the active store's path and labels it `(project)` or `(global)`. Legacy `index.json` files are auto-migrated to SQLite on first run. If you previously used `~/.pi/lens/`, that directory is migrated to `~/.pi/rag/` on first run.
 
 ## Exclude Patterns
 
