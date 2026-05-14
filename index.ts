@@ -289,17 +289,16 @@ function migrateFromJson(db: Database.Database, jsonPath: string): void {
       INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
-    const insVec = db.prepare("INSERT INTO chunks_vec(embedding) VALUES (?)");
+    const insVec = db.prepare("INSERT INTO chunks_vec(rowid, embedding) VALUES (CAST(? AS INTEGER), ?)");
     const insFile = db.prepare(`
       INSERT OR REPLACE INTO files(path, hash, chunks, indexed, size, embedded)
       VALUES (?, ?, ?, ?, ?, ?)
     `);
 
     for (const c of data.chunks) {
-      insChunk.run(c.id, c.file, c.content, c.lineStart, c.lineEnd, c.hash, c.indexed, c.tokens);
+      const chunkResult = insChunk.run(c.id, c.file, c.content, c.lineStart, c.lineEnd, c.hash, c.indexed, c.tokens);
       if (c.vector && c.vector.length === VECTOR_DIM) {
-        const buf = float32ToBuffer(c.vector);
-        insVec.run(buf);
+        insVec.run(Number(chunkResult.lastInsertRowid), float32ToBuffer(c.vector));
       }
     }
 
@@ -625,7 +624,6 @@ export async function indexFiles(
     INSERT INTO chunks(id, file_path, chunk_content, line_start, line_end, chunk_hash, indexed_at, tokens)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  const insVec = database.prepare("INSERT INTO chunks_vec(embedding) VALUES (?)");
   const upsertFile = database.prepare(`
     INSERT INTO files(path, hash, chunks, indexed, size, embedded)
     VALUES (?, ?, ?, ?, ?, ?)
@@ -670,9 +668,11 @@ export async function indexFiles(
       );
 
       const tx = database.transaction(() => {
+        const insVecRowid = database.prepare("INSERT INTO chunks_vec(rowid, embedding) VALUES (CAST(? AS INTEGER), ?)");
         for (let j = 0; j < rawChunks.length; j++) {
           const chunk = rawChunks[j];
-          insChunk.run(
+          // Insert chunk and capture rowid for vector alignment
+          const chunkResult = insChunk.run(
             `${sha256(fp)}-${chunk.lineStart}`,
             fp,
             chunk.content,
@@ -682,10 +682,8 @@ export async function indexFiles(
             new Date().toISOString(),
             Math.ceil(chunk.content.length / 4),
           );
-          // Insert vector (rowid in chunks_vec must match chunks.rowid)
-          const rowid = database.prepare("SELECT last_insert_rowid()").get() as { last_insert_rowid(): number };
-          // chunks_vec uses auto rowid, so we insert in order matching chunks inserts
-          insVec.run(float32ToBuffer(vectors[j]));
+          // Insert vector with explicit rowid matching chunks.rowid
+          insVecRowid.run(Number(chunkResult.lastInsertRowid), float32ToBuffer(vectors[j]));
           chunked++;
         }
         upsertFile.run(fp, hash, rawChunks.length, new Date().toISOString(), size, 1);
@@ -836,7 +834,6 @@ export async function hybridSearch(
         for (const [k, v] of normalized) vecNormMap.set(k, v);
       } else {
         // Single result or all equal → give max score
-        vecNormMap.clear();
         for (const k of vecNormMap.keys()) vecNormMap.set(k, 1);
       }
     }
