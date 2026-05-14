@@ -782,12 +782,16 @@ export async function hybridSearch(
     if (chunkCount.c === 0) return [];
 
     // ── BM25 via FTS5 ──
+    // Escape the query as a literal FTS5 string: wrap in double-quotes,
+    // doubling any embedded double-quotes.  This safely handles single
+    // quotes, parens, boolean operators, etc.
+    const ftsQuery = `"${query.replace(/"/g, '""')}"`;
     const ftsResults = database.prepare(`
       SELECT chunks_fts.rowid, bm25(chunks_fts) as bm25_score
       FROM chunks_fts
       WHERE chunks_fts MATCH ?
       ORDER BY bm25(chunks_fts)
-    `).all(query);
+    `).all(ftsQuery);
 
     // ── Vector via sqlite-vec ──
     const queryVec = await embed(query);
