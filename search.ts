@@ -48,27 +48,31 @@ export async function hybridSearch(
   const shouldClose = !_db;
 
   try {
-    const chunkCount = database.prepare("SELECT COUNT(*) as c FROM chunks").get() as { c: number };
-    if (chunkCount.c === 0) return [];
+    // Fast existence check — LIMIT 1 avoids full table scan
+    const hasChunks = database.prepare("SELECT 1 FROM chunks LIMIT 1").get();
+    if (!hasChunks) return [];
 
-    // BM25 via FTS5
-    const ftsQuery = `"${query.replace(/"/g, '""')}"`;
+    // BM25 via FTS5 — cap candidates to avoid scanning entire index
+    const ftsQuery = query.split(/\s+/).map(t => `"${t.replace(/"/g, '""')}"`).join(" ");
+    const ftsLimit = Math.max(limit * 20, 200);
     const ftsResults = database.prepare(`
       SELECT chunks_fts.rowid, bm25(chunks_fts) as bm25_score
       FROM chunks_fts
       WHERE chunks_fts MATCH ?
       ORDER BY bm25(chunks_fts)
-    `).all(ftsQuery);
+      LIMIT ?
+    `).all(ftsQuery, ftsLimit);
 
     // Vector via sqlite-vec
     const queryVec = await embed(query);
     const queryBuf = float32ToBuffer(queryVec);
+    const vecLimit = Math.max(limit * 10, 100);
     const vecResults = database.prepare(`
       SELECT rowid, distance
       FROM chunks_vec
       WHERE embedding MATCH ?
       LIMIT ?
-    `).bind(queryBuf, Math.max(limit, 50)).all();
+    `).bind(queryBuf, vecLimit).all();
 
     const ftsRowIds = new Set(ftsResults.map((r: any) => r.rowid));
     const vecRowIds = new Set(vecResults.map((r: any) => r.rowid));

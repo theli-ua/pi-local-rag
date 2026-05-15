@@ -16,7 +16,12 @@ process.env.PI_RAG_DIR = `${TEST_HOME}/.pi/rag`;
 // Prevent real ONNX model downloads; return a fixed 384-dim vector
 vi.mock("@xenova/transformers", () => ({
   pipeline: vi.fn().mockResolvedValue(
-    vi.fn().mockResolvedValue({ data: new Float32Array(384).fill(0.1) }),
+    vi.fn().mockImplementation(async (texts: string | string[]) => {
+      if (Array.isArray(texts)) {
+        return texts.map(() => ({ data: new Float32Array(384).fill(0.1) }));
+      }
+      return { data: new Float32Array(384).fill(0.1) };
+    }),
   ),
 }));
 

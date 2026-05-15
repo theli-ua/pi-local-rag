@@ -59,6 +59,9 @@ function stderrProgress(msg: string) {
 
 export default function (pi: ExtensionAPI) {
   // ── Auto-inject RAG context ──────────────────────────────────────────────
+  let lastStaleCheckMs = 0;
+  const STALE_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+
   pi.on("before_agent_start", async (event, _ctx) => {
     const config = loadConfig();
     if (!config.ragEnabled) return;
@@ -69,7 +72,9 @@ export default function (pi: ExtensionAPI) {
       if (stats.totalChunks === 0) return;
 
       const indexMeta = { chunks: [], files: {}, lastBuild: stats.lastBuild, embeddingModel: stats.embeddingModel };
-      if (isIndexStale(indexMeta)) {
+      const now = Date.now();
+      if (isIndexStale(indexMeta) && now - lastStaleCheckMs > STALE_CHECK_INTERVAL_MS) {
+        lastStaleCheckMs = now;
         const files = config.trackedPaths.length
           ? collectFromTracked(config)
           : Object.keys(loadIndex().files).filter(f => existsSync(f));
