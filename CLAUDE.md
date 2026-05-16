@@ -25,7 +25,7 @@ Node >=20 required. There is no lint script configured.
 | `store.ts` | Store resolution: `getRagDir()` walk-up logic, `ensureDir()`, path helpers, legacy `lens→rag` migration. |
 | `config.ts` | Config load/save: `RagConfig` type, `loadConfig()`, `saveConfig()`, `defaultConfig()`. |
 | `db.ts` | Database layer: `openDb()`, `initSchema()`, `getIndexStats()`, `loadIndex()`, `float32ToBuffer()`, legacy JSON→SQLite migration. Defines `Chunk`, `IndexMeta`, `IndexStats` types. |
-| `chunking.ts` | File ingestion: `chunkText()`, `collectFiles()`, `collectFromTracked()`, `isExcludedByConfig()`, `extractText()` (PDF/DOCX/plain), `sha256()`. |
+| `chunking.ts` | File ingestion: `chunkText()`, `collectFiles()`, `collectFromTracked()`, `isExcludedByConfig()`, `extractText()` (PDF/DOCX/HTML→Markdown/plain), `sha256()`. |
 | `embed.ts` | Embedding: `getEmbedder()` (lazy singleton), `embed()`, `embedBatch()` with progress callback. |
 | `search.ts` | Retrieval: `hybridSearch()` (FTS5 BM25 + sqlite-vec), `cosineSimilarity()`, `normalize()`. Defines `ScoredChunk` type. |
 | `indexing.ts` | Indexing pipeline: `indexFiles()` (parallel read → batch embed → DB insert), `isIndexStale()`, progress helpers. |
@@ -58,9 +58,10 @@ Config is stored as JSON in `config.json`: `{ ragEnabled, ragTopK, ragScoreThres
 
 1. Walk directory tree, filtering by `TEXT_EXTS` and skipping `SKIP_DIRS` plus hidden dirs. Files >500 KB skipped (binary docs <10 MB).
 2. SHA-256 hash the file content; skip if hash matches existing DB entry with `embedded=1`.
-3. Chunk each file: split on blank lines, cap at 50 lines, backtrack up to 15 lines to find a blank-line boundary. Discard chunks <20 chars.
-4. Parallel read + chunk (bounded concurrency=32), then batch-embed via `@xenova/transformers` (`Xenova/all-MiniLM-L6-v2`, 384-dim ONNX) in cross-file groups of 256.
-5. Insert chunks + vectors into SQLite in a single transaction.
+3. **Text extraction**: PDF via `pdf-parse`, DOCX via `mammoth`, HTML via `turndown` (converts to Markdown, strips scripts/styles/nav/footer), plain text via `readFileSync`. Hash is computed from the **raw** file content so changes are always detected.
+4. Chunk each file: split on blank lines, cap at 50 lines, backtrack up to 15 lines to find a blank-line boundary. Discard chunks <20 chars.
+5. Parallel read + chunk (bounded concurrency=32), then batch-embed via `@xenova/transformers` (`Xenova/all-MiniLM-L6-v2`, 384-dim ONNX) in cross-file groups of 256.
+6. Insert chunks + vectors into SQLite in a single transaction.
 
 ### Search
 

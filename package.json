@@ -63,7 +63,8 @@
     "ignore": "^7.0.0",
     "mammoth": "^1.8.0",
     "pdf-parse": "^1.1.1",
-    "sqlite-vec": "^0.1.9"
+    "sqlite-vec": "^0.1.9",
+    "turndown": "^7.2.4"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.60.0",

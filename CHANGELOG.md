@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.0
+
+- **HTML → Markdown conversion**: `.html` files are now converted to Markdown in memory via `turndown` before indexing. Scripts, styles, nav, and footer elements are stripped, producing clean semantic content. This dramatically improves BM25 and vector search quality for HTML documentation (e.g. Unity manual docs). Dependency added: `turndown@7.2.4`.
+
 ## 0.4.0
 
 - **SQLite storage**: replaced `index.json` with `rag.db` (SQLite + FTS5 + sqlite-vec)

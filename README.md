@@ -11,7 +11,7 @@ Backed by **SQLite FTS5** (BM25) and **sqlite-vec** (vector search) for fast ret
 - **Hybrid BM25 + vector search** — SQLite FTS5 keyword scoring blended with ONNX embeddings via sqlite-vec
 - **Fast** — O(log n) index lookups, not O(n) in-memory scans
 - **Smart chunking** — splits files into ~50-line blocks at natural blank-line boundaries
-- **PDF + DOCX support** — extracts text from binary documents via `pdf-parse` and `mammoth`
+- **PDF + DOCX + HTML support** — extracts text from binary documents via `pdf-parse` and `mammoth`; HTML files are converted to Markdown via `turndown` (strips scripts, styles, nav/footer noise)
 - **Incremental indexing** — skips unchanged files (SHA-256 hash check)
 - **Auto-refresh** — stale index (24h+) is silently refreshed before auto-injection
 - **Exclude patterns** — gitignore-style patterns to skip files or directories
@@ -51,6 +51,8 @@ The extension registers three tools the agent can call directly:
 **Text files** (< 500 KB): `.md`, `.txt`, `.ts`, `.js`, `.py`, `.rs`, `.go`, `.java`, `.c`, `.cpp`, `.h`, `.cs`, `.css`, `.html`, `.json`, `.yaml`, `.yml`, `.toml`, `.xml`, `.csv`, `.sh`, `.sql`, `.graphql`, `.proto`, `.env`, `.gitignore`, `.dockerfile`
 
 **Binary documents** (< 10 MB): `.pdf`, `.docx`
+
+> **Note:** `.html` files are converted to Markdown in memory via [`turndown`](https://github.com/mixmark-io/turndown) before indexing — scripts, styles, nav, and footer elements are stripped, producing clean semantic content for both BM25 and vector search.
 
 Directories named `node_modules`, `.git`, `.next`, `dist`, `build`, `__pycache__`, `.venv`, `venv`, `.cache` and any hidden directory (starting with `.`) are always skipped.
 

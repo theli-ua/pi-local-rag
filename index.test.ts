@@ -26,6 +26,7 @@ vi.mock("@xenova/transformers", () => ({
 }));
 
 import { isIndexStale, getRagDir, loadConfig, saveConfig, openDb, getIndexStats, initSchema } from "./index.js";
+import { extractText } from "./chunking.js";
 import defaultExport from "./index.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -161,6 +162,122 @@ describe("isIndexStale", () => {
     const tenMinAgo = new Date(Date.now() - 10 * 60 * 1_000).toISOString();
     expect(isIndexStale({ chunks: [], files: {}, lastBuild: tenMinAgo } as any, 5 * 60 * 1_000)).toBe(true);
     expect(isIndexStale({ chunks: [], files: {}, lastBuild: tenMinAgo } as any, 15 * 60 * 1_000)).toBe(false);
+  });
+});
+
+// ─── extractText HTML → markdown ───────────────────────────────────────────
+
+describe("extractText HTML", () => {
+  beforeAll(() => { mkdirSync(TEST_HOME, { recursive: true }); });
+  afterAll(() => { rmSync(TEST_HOME, { recursive: true, force: true }); });
+
+  it("converts simple HTML to markdown", async () => {
+    const fp = join(TEST_HOME, "simple.html");
+    writeFileSync(fp, "<p>Hello <strong>world</strong></p>");
+    const { text } = await extractText(fp);
+    expect(text).toContain("Hello");
+    expect(text).toContain("world");
+    expect(text).not.toContain("<p>");
+    expect(text).not.toContain("<strong>");
+  });
+
+  it("removes script and style blocks", async () => {
+    const fp = join(TEST_HOME, "no-script.html");
+    writeFileSync(fp, "<p>Before</p><script>alert('xss')</script><style>.x{}</style><p>After</p>");
+    const { text } = await extractText(fp);
+    expect(text).toContain("Before");
+    expect(text).toContain("After");
+    expect(text).not.toContain("alert");
+    expect(text).not.toContain("script");
+    expect(text).not.toContain(".x{}");
+  });
+
+  it("removes nav and footer elements", async () => {
+    const fp = join(TEST_HOME, "no-nav.html");
+    writeFileSync(fp, "<nav>Home | About</nav><p>Content</p><footer>Copyright</footer>");
+    const { text } = await extractText(fp);
+    expect(text).toContain("Content");
+    expect(text).not.toContain("Home | About");
+    expect(text).not.toContain("Copyright");
+  });
+
+  it("converts headings to atx style", async () => {
+    const fp = join(TEST_HOME, "headings.html");
+    writeFileSync(fp, "<h1>Title</h1><h2>Subtitle</h2><p>Body</p>");
+    const { text } = await extractText(fp);
+    expect(text).toContain("# Title");
+    expect(text).toContain("## Subtitle");
+    expect(text).toContain("Body");
+  });
+
+  it("fences code blocks", async () => {
+    const fp = join(TEST_HOME, "code.html");
+    writeFileSync(fp, '<pre><code class="lang-cs">var x = 1;</code></pre>');
+    const { text } = await extractText(fp);
+    expect(text).toContain("```");
+    expect(text).toContain("var x = 1;");
+  });
+
+  it("converts lists to markdown", async () => {
+    const fp = join(TEST_HOME, "lists.html");
+    writeFileSync(fp, "<ul><li>One</li><li>Two</li></ul>");
+    const { text } = await extractText(fp);
+    expect(text).toContain("One");
+    expect(text).toContain("Two");
+    expect(text).not.toContain("<li>");
+  });
+
+  it("hashes the raw HTML, not the markdown", async () => {
+    const fp = join(TEST_HOME, "hash-test.html");
+    const raw = "<p>Content</p>";
+    writeFileSync(fp, raw);
+    const { hash, text } = await extractText(fp);
+    // hash is first 12 hex chars of sha256 of raw HTML
+    expect(hash).toMatch(/^[0-9a-f]{12}$/);
+    expect(text).not.toContain("<p>");
+  });
+
+  it("handles real-world Unity doc HTML structure", async () => {
+    const fp = join(TEST_HOME, "unity-doc.html");
+    const html = `<!DOCTYPE html><html><head><script>var x = 1;</script></head>
+<body><nav>Navigation</nav><div class="content"><h1>Add textures to the camera history</h1>
+<p>To add your own texture to the <strong>camera</strong> history.</p>
+<pre><code>public class Example : CameraHistoryItem { }</code></pre>
+<ul><li>Step one</li><li>Step two</li></ul>
+</div><footer>Copyright</footer></body></html>`;
+    writeFileSync(fp, html);
+    const { text } = await extractText(fp);
+    expect(text).toContain("# Add textures to the camera history");
+    expect(text).toContain("camera");
+    expect(text).toContain("public class Example : CameraHistoryItem { }");
+    expect(text).toContain("Step one");
+    expect(text).toContain("Step two");
+    expect(text).not.toContain("<script>");
+    expect(text).not.toContain("var x");
+    expect(text).not.toContain("Navigation");
+    expect(text).not.toContain("Copyright");
+  });
+
+  it("returns text and hash for non-HTML files unchanged", async () => {
+    const fp = join(TEST_HOME, "plain.txt");
+    writeFileSync(fp, "just text");
+    const { text } = await extractText(fp);
+    expect(text).toBe("just text");
+  });
+
+  it("produces much smaller output than raw HTML for Unity docs", async () => {
+    const fp = join(TEST_HOME, "big.html");
+    // Simulate a Unity doc with lots of script/style/nav boilerplate
+    const html = "<script>" + "x".repeat(5000) + "</script>"
+      + "<style>" + "y".repeat(3000) + "</style>"
+      + "<nav>" + "z".repeat(2000) + "</nav>"
+      + "<p>Actual content here about framebuffer fetch</p>"
+      + "<footer>" + "w".repeat(1000) + "</footer>";
+    writeFileSync(fp, html);
+    const { text } = await extractText(fp);
+    expect(text.length).toBeLessThan(html.length / 2);
+    expect(text).toContain("Actual content here about framebuffer fetch");
+    expect(text).not.toContain("x".repeat(100));
   });
 });
 

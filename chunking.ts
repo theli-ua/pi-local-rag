@@ -134,6 +134,21 @@ export async function extractText(fp: string): Promise<{ text: string; hash: str
     const { value } = await mammoth.extractRawText({ buffer: buf });
     return { text: value, hash: sha256(buf.toString("binary")), size: buf.length };
   }
+  if (ext === ".html") {
+    const { default: TurndownService } = await import("turndown");
+    const raw = readFileSync(fp, "utf-8");
+    const td = new TurndownService({
+      headingStyle: "atx",
+      codeBlockStyle: "fenced",
+      blankReplacement: (_content: unknown, node: Node) => (node as HTMLElement).tagName === "BR" ? "\n" : "",
+    });
+    // Remove script/style elements before conversion
+    td.remove(["script", "style"]);
+    // Strip navigation/footer elements that add noise
+    td.remove(["nav", "footer"]);
+    const text = td.turndown(raw);
+    return { text, hash: sha256(raw), size: raw.length };
+  }
   const text = readFileSync(fp, "utf-8");
   return { text, hash: sha256(text), size: text.length };
 }
