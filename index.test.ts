@@ -521,6 +521,48 @@ describe("/rag rebuild new-file discovery", () => {
   });
 });
 
+// ─── /rag rebuild --force ────────────────────────────────────────────────────
+
+describe("/rag rebuild --force", () => {
+  beforeAll(() => {
+    mkdirSync(RAG_DIR, { recursive: true });
+  });
+
+  afterAll(() => {
+    rmSync(TEST_HOME, { recursive: true, force: true });
+  });
+
+  it("re-embeds unchanged files when --force is passed", async () => {
+    const projDir = join(TEST_HOME, "proj-rebuild-force");
+    mkdirSync(projDir, { recursive: true });
+    const testFile = join(projDir, "unchanged.ts");
+    writeFileSync(testFile, "export const force = true;\n");
+
+    writeFileSync(CONFIG_FILE, JSON.stringify({ ...DEFAULT_CONFIG, trackedPaths: [projDir], excludePatterns: [] }));
+
+    // Index first.
+    const { pi, run, ctx } = makePi();
+    defaultExport(pi as any);
+    await run(`index ${projDir}`);
+
+    // Normal rebuild — should skip unchanged file.
+    (ctx.ui.notify as vi.Mock).mockClear();
+    await run("rebuild");
+    const normalNotifications = (ctx.ui.notify as vi.Mock).mock.calls.map((c: any[]) => c[0]);
+    const normalSummary = normalNotifications.filter((m: string) => /Rebuilt:|re-indexed/.test(m));
+    expect(normalSummary.length).toBeGreaterThan(0);
+    expect(normalSummary[normalSummary.length - 1]).toMatch(/\d+ unchanged/);
+
+    // Force rebuild — should re-embed everything (0 unchanged).
+    (ctx.ui.notify as vi.Mock).mockClear();
+    await run("rebuild --force");
+    const forceNotifications = (ctx.ui.notify as vi.Mock).mock.calls.map((c: any[]) => c[0]);
+    const forceSummary = forceNotifications.filter((m: string) => /Rebuilt:|re-indexed/.test(m));
+    expect(forceSummary.length).toBeGreaterThan(0);
+    expect(forceSummary[forceSummary.length - 1]).toMatch(/0 unchanged/);
+  });
+});
+
 // ─── /rag status output ──────────────────────────────────────────────────────
 
 describe("/rag status output", () => {

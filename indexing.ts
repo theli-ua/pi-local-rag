@@ -9,6 +9,7 @@ import { IndexMeta } from "./db.js";
 export interface ProgressCallbacks {
   onFile?: (current: number, total: number, filename: string, skipped: number) => void;
   onChunk?: (fileChunk: number, totalChunks: number, filename: string) => void;
+  onEmbed?: (done: number, total: number) => void;
   onSave?: () => void;
 }
 
@@ -37,7 +38,8 @@ interface FileWork {
 export async function indexFiles(
   paths: string[],
   progress?: ProgressCallbacks,
-  _db?: Database.Database
+  _db?: Database.Database,
+  force?: boolean
 ): Promise<{ indexed: number; chunks: number; skipped: number; durationMs: number }> {
   const hadCallbacks = !!progress;
   if (hadCallbacks) _suppressStderr = true;
@@ -56,7 +58,7 @@ export async function indexFiles(
 
     // Phase 1: parallel read + chunk; DB ops on main thread
     const CONCURRENCY = 32;
-    const YIELD_INTERVAL = 64;
+    const YIELD_INTERVAL = 1;
 
     interface ReadResult { fp: string; hash: string; size: number; raw: { content: string; lineStart: number; lineEnd: number }[] }
 
@@ -101,7 +103,7 @@ export async function indexFiles(
         const name = basename(r.fp);
 
         const existing = getFileStmt.get(r.fp) as { hash?: string; embedded?: number } | undefined;
-        if (existing?.hash === r.hash && existing?.embedded) {
+        if (!force && existing?.hash === r.hash && existing?.embedded) {
           skipped++;
           progress?.onFile?.(processedCount, total, name, skipped);
           continue;
@@ -140,19 +142,21 @@ export async function indexFiles(
     const groupChunks: { fw: FileWork; ci: number }[] = [];
     let globalChunkIdx = 0;
 
+    const totalChunks = toIndex.reduce((s, f) => s + f.rawChunks.length, 0);
     const flushGroup = async () => {
       if (groupChunks.length === 0) return;
       const texts = groupChunks.map(g => g.fw.rawChunks[g.ci].content);
-      const totalChunks = toIndex.reduce((s, f) => s + f.rawChunks.length, 0);
       stderrProgress(`Embedding ${globalChunkIdx - groupChunks.length + 1}…${globalChunkIdx}/${totalChunks} chunks`);
-      await yield_();
       const vectors = await embedBatch(texts);
       for (let vi = 0; vi < groupChunks.length; vi++) {
         const g = groupChunks[vi];
         g.fw._vectors ??= new Array(g.fw.rawChunks.length);
         g.fw._vectors[g.ci] = vectors[vi];
       }
+      progress?.onEmbed?.(globalChunkIdx, totalChunks);
       groupChunks.length = 0;
+      // Yield so the TUI can render the progress update.
+      await yield_();
     };
 
     for (const fw of toIndex) {

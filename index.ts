@@ -38,7 +38,7 @@ import { loadConfig, saveConfig } from "./config.js";
 import { openDb, getIndexStats, loadIndex } from "./db.js";
 import { indexFiles, isIndexStale } from "./indexing.js";
 import { hybridSearch } from "./search.js";
-import { collectFiles, collectFromTracked, isExcludedByConfig } from "./chunking.js";
+import { collectFiles, collectFromTracked, collectFromTrackedAsync, isExcludedByConfig } from "./chunking.js";
 
 const RST = "\x1b[0m", B = "\x1b[1m", D = "\x1b[2m";
 const GREEN = "\x1b[32m", CYAN = "\x1b[36m";
@@ -138,6 +138,15 @@ export default function (pi: ExtensionAPI) {
             `${D}done:    ${RST}${GREEN}${current - skipped} embedded${RST}  ${D}${skipped} unchanged${RST}`,
           ]);
         },
+        onEmbed(done, total) {
+          const pct = Math.round((done / total) * 100);
+          const bar = progressBar(done, total);
+          ctx.ui.setStatus("rag", `■ Embedding ${pct}% │ ${done}/${total} chunks`);
+          ctx.ui.setWidget("rag", [
+            `${B}${CYAN}Embedding${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
+            `${D}chunks:  ${RST}${done}/${total}`,
+          ]);
+        },
         onChunk(ci, total, filename) {
           ctx.ui.setStatus("rag", `■ Embedding ${filename} — chunk ${ci}/${total}`);
         },
@@ -192,13 +201,14 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.notify(mode === "on" ? "RAG auto-injection enabled" : "RAG auto-injection disabled", mode === "on" ? "success" : "warning");
   }
 
-  async function cmdRebuild(ctx: RagCommandCtx) {
+  async function cmdRebuild(ctx: RagCommandCtx, force: boolean) {
     const database = openDb();
     const config = loadConfig();
     try {
       const indexedFiles = database.prepare("SELECT path FROM files").all() as Array<{ path: string }>;
       const indexedFileSet = new Set(indexedFiles.map(f => f.path));
-      const trackedFiles = collectFromTracked(config);
+      ctx.ui.notify("Scanning tracked paths...");
+      const trackedFiles = await collectFromTrackedAsync(config);
 
       const targetSet = new Set<string>([...trackedFiles]);
       for (const f of indexedFileSet) {
@@ -219,14 +229,22 @@ export default function (pi: ExtensionAPI) {
         database.prepare("DELETE FROM chunks WHERE file_path = ?").run(f);
         database.prepare("DELETE FROM files WHERE path = ?").run(f);
       }
-      for (const f of targetFiles) {
-        database.prepare("UPDATE files SET embedded = 0 WHERE path = ?").run(f);
+      if (force) {
+        database.exec("DELETE FROM chunks_vec; DELETE FROM chunks; DELETE FROM files;");
+        database.exec("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')");
+      } else {
+        for (const f of targetFiles) {
+          database.prepare("UPDATE files SET embedded = 0 WHERE path = ?").run(f);
+        }
       }
 
       const newFiles = targetFiles.filter(f => !indexedFileSet.has(f));
+      ctx.ui.notify(`Rebuilding ${targetFiles.length} files${force ? " (forced)" : ""}...`, "info");
       if (droppedFiles.length) ctx.ui.notify(`Pruned ${droppedFiles.length} files (deleted/excluded)`, "info");
       if (newFiles.length) ctx.ui.notify(`Discovered ${newFiles.length} new files`, "info");
-      ctx.ui.notify(`Rebuilding ${targetFiles.length} files...`, "info");
+
+      // Yield so the TUI can paint the "Rebuilding" message before we start.
+      await new Promise<void>(r => setTimeout(r, 0));
 
       const result = await indexFiles(targetFiles, {
         onFile(current, total, filename, skipped) {
@@ -239,11 +257,20 @@ export default function (pi: ExtensionAPI) {
             `${D}done:    ${RST}${GREEN}${current - skipped} re-embedded${RST}  ${D}${skipped} unchanged${RST}`,
           ]);
         },
+        onEmbed(done, total) {
+          const pct = Math.round((done / total) * 100);
+          const bar = progressBar(done, total);
+          ctx.ui.setStatus("rag", `■ Embedding ${pct}% │ ${done}/${total} chunks`);
+          ctx.ui.setWidget("rag", [
+            `${B}${CYAN}Embedding${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
+            `${D}chunks:  ${RST}${done}/${total}`,
+          ]);
+        },
         onChunk(ci, total, filename) {
           ctx.ui.setStatus("rag", `■ Embedding ${filename} — chunk ${ci}/${total}`);
         },
         onSave() { ctx.ui.setStatus("rag", `■ Saving index...`); },
-      }, database);
+      }, database, force);
 
       ctx.ui.setStatus("rag", undefined);
       ctx.ui.setWidget("rag", undefined);
@@ -382,7 +409,7 @@ export default function (pi: ExtensionAPI) {
     { value: "search", label: "search", description: "Search the index" },
     { value: "find", label: "find", description: "Find indexed files by glob" },
     { value: "status", label: "status", description: "Show index statistics" },
-    { value: "rebuild", label: "rebuild", description: "Rebuild entire index" },
+    { value: "rebuild", label: "rebuild", description: "Rebuild entire index (--force to skip hash check)" },
     { value: "clear", label: "clear", description: "Clear the index" },
     { value: "exclude", label: "exclude", description: "Manage exclude patterns" },
     { value: "on", label: "on", description: "Enable auto-injection" },
@@ -390,7 +417,7 @@ export default function (pi: ExtensionAPI) {
   ];
 
   pi.registerCommand("rag", {
-    description: "pi-local-rag: /rag index|search|find|status|rebuild|clear|exclude|on|off",
+    description: "pi-local-rag: /rag index|search|find|status|rebuild [--force]|clear|exclude|on|off",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
       const filtered = RAG_SUBCOMMANDS
         .filter((s) => s.value.startsWith(prefix))
@@ -406,7 +433,12 @@ export default function (pi: ExtensionAPI) {
         case "exclude": cmdExclude(parts.slice(1).join(" ").trim(), ctx); break;
         case "find": cmdFind(parts.slice(1).join(" ").trim(), ctx); break;
         case "on": case "off": cmdToggle(cmd, ctx); break;
-        case "rebuild": await cmdRebuild(ctx); break;
+        case "rebuild": {
+          const rebuildArgs = parts.slice(1);
+          const force = rebuildArgs.includes("--force");
+          await cmdRebuild(ctx, force);
+          break;
+        }
         case "clear": cmdClear(ctx); break;
         default: cmdStatus(ctx);
       }

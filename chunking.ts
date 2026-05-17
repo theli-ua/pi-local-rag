@@ -1,9 +1,11 @@
-import { readFileSync, existsSync, statSync, readdirSync } from "node:fs";
+import { readFileSync, existsSync, statSync, readdirSync, promises as fsPromises } from "node:fs";
 import { extname, basename, join, relative } from "node:path";
 import ignore from "ignore";
 import { createHash } from "node:crypto";
 import { RagConfig } from "./config.js";
 import { TEXT_EXTS, BINARY_DOC_EXTS, TEXT_MAX_BYTES, BINARY_DOC_MAX_BYTES, SKIP_DIRS } from "./constants.js";
+
+const yield_ = () => new Promise<void>(r => setTimeout(r, 0));
 
 export function sha256(data: string): string {
   return createHash("sha256").update(data).digest("hex").slice(0, 12);
@@ -87,6 +89,71 @@ export function collectFromTracked(cfg: RagConfig): string[] {
   for (const p of cfg.trackedPaths) {
     if (!existsSync(p)) continue;
     for (const f of collectFiles(p, cfg.excludePatterns)) out.add(f);
+  }
+  return [...out];
+}
+
+export async function collectFilesAsync(dirPath: string, excludePatterns: string[] = []): Promise<string[]> {
+  const ig = excludePatterns.length ? ignore().add(excludePatterns) : null;
+  const files: string[] = [];
+
+  function isExcluded(absPath: string, root: string): boolean {
+    if (!ig) return false;
+    const rel = relative(root, absPath);
+    if (!rel || rel.startsWith("..")) return false;
+    return ig.ignores(rel);
+  }
+
+  function acceptable(fp: string, size: number): boolean {
+    const ext = extname(fp).toLowerCase();
+    if (TEXT_EXTS.has(ext)) return size < TEXT_MAX_BYTES;
+    if (BINARY_DOC_EXTS.has(ext)) return size < BINARY_DOC_MAX_BYTES;
+    return false;
+  }
+
+  async function walk(dir: string, root: string): Promise<void> {
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = await fsPromises.readdir(dir, { withFileTypes: true });
+    } catch { return; }
+    for (const entry of entries) {
+      const fp = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (SKIP_DIRS.has(entry.name) || entry.name.startsWith(".")) continue;
+        if (isExcluded(fp, root)) continue;
+        await walk(fp, root);
+      } else {
+        const ext = extname(entry.name).toLowerCase();
+        if (!TEXT_EXTS.has(ext) && !BINARY_DOC_EXTS.has(ext)) continue;
+        if (isExcluded(fp, root)) continue;
+        try {
+          const st = await fsPromises.stat(fp);
+          if (acceptable(fp, st.size)) files.push(fp);
+        } catch {}
+      }
+    }
+    // Yield periodically so the event loop can process UI updates.
+    await yield_();
+  }
+
+  try {
+    const st = await fsPromises.stat(dirPath);
+    if (st.isFile()) {
+      if (!acceptable(dirPath, st.size)) return [];
+      if (ig && ig.ignores(basename(dirPath))) return [];
+      return [dirPath];
+    }
+  } catch { return []; }
+
+  await walk(dirPath, dirPath);
+  return files;
+}
+
+export async function collectFromTrackedAsync(cfg: RagConfig): Promise<string[]> {
+  const out = new Set<string>();
+  for (const p of cfg.trackedPaths) {
+    if (!existsSync(p)) continue;
+    for (const f of await collectFilesAsync(p, cfg.excludePatterns)) out.add(f);
   }
   return [...out];
 }

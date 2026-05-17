@@ -17,6 +17,13 @@ export async function embed(text: string): Promise<number[]> {
 
 const EMBED_BATCH_SIZE = 64;
 
+/**
+ * Yield to the event loop so the TUI can render progress updates.
+ * ONNX inference is synchronous from the event loop's perspective;
+ * without this, the UI freezes during embedding.
+ */
+const yield_ = () => new Promise<void>(r => setTimeout(r, 0));
+
 export async function embedBatch(texts: string[], onProgress?: (i: number, total: number) => void): Promise<number[][]> {
   const embedder = await getEmbedder();
   const results: number[][] = [];
@@ -33,6 +40,9 @@ export async function embedBatch(texts: string[], onProgress?: (i: number, total
     }
     const done = start + batch.length;
     for (let b = 0; b < batch.length; b++) onProgress?.(done - batch.length + b + 1, texts.length);
+    // Yield after every micro-batch so the event loop can process UI updates.
+    // Without this, ONNX blocks the loop for seconds and the TUI freezes.
+    await yield_();
   }
   return results;
 }
