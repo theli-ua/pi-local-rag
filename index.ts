@@ -73,7 +73,7 @@ export default function (pi: ExtensionAPI) {
 
       const indexMeta = { chunks: [], files: {}, lastBuild: stats.lastBuild, embeddingModel: stats.embeddingModel };
       const now = Date.now();
-      if (isIndexStale(indexMeta) && now - lastStaleCheckMs > STALE_CHECK_INTERVAL_MS) {
+      if (config.ragAutoRefresh && isIndexStale(indexMeta) && now - lastStaleCheckMs > STALE_CHECK_INTERVAL_MS) {
         lastStaleCheckMs = now;
         const files = config.trackedPaths.length
           ? collectFromTracked(config)
@@ -111,6 +111,53 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── /rag subcommands ─────────────────────────────────────────────────────
+
+  async function cmdRefresh(ctx: RagCommandCtx) {
+    const config = loadConfig();
+    const database = openDb();
+    try {
+      const files = config.trackedPaths.length
+        ? await collectFromTrackedAsync(config)
+        : Object.keys(loadIndex().files).filter(f => existsSync(f));
+      if (!files.length) {
+        ctx.ui.notify("No tracked paths configured. Run /rag index <path> first.", "warning");
+        return;
+      }
+      ctx.ui.notify(`Refreshing ${files.length} files…`, "info");
+      const result = await indexFiles(files, {
+        onFile(current, total, filename, skipped) {
+          const pct = Math.round((current / total) * 100);
+          const bar = progressBar(current, total);
+          ctx.ui.setStatus("rag", `■ Refreshing ${pct}% │ ${current}/${total} │ ${skipped} unchanged`);
+          ctx.ui.setWidget("rag", [
+            `${B}${CYAN}Refreshing${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
+            `${D}file:    ${RST}${filename}`,
+            `${D}done:    ${RST}${GREEN}${current - skipped} embedded${RST}  ${D}${skipped} unchanged${RST}`,
+          ]);
+        },
+        onEmbed(done, total) {
+          const pct = Math.round((done / total) * 100);
+          const bar = progressBar(done, total);
+          ctx.ui.setStatus("rag", `■ Embedding ${pct}% │ ${done}/${total} chunks`);
+          ctx.ui.setWidget("rag", [
+            `${B}${CYAN}Embedding${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
+            `${D}chunks:  ${RST}${done}/${total}`,
+          ]);
+        },
+        onChunk(ci, total, filename) {
+          ctx.ui.setStatus("rag", `■ Embedding ${filename} — chunk ${ci}/${total}`);
+        },
+        onSave() { ctx.ui.setStatus("rag", `■ Saving index...`); },
+      }, database);
+
+      ctx.ui.setStatus("rag", undefined);
+      ctx.ui.setWidget("rag", undefined);
+      const secs = (result.durationMs / 1000).toFixed(1);
+      ctx.ui.notify(`Refreshed: ${result.indexed} files (${result.chunks} chunks) │ ${result.skipped} unchanged │ ${secs}s`, "success");
+    } finally {
+      database.close();
+    }
+  }
 
   async function cmdIndex(path: string, ctx: RagCommandCtx) {
     if (!existsSync(path)) { ctx.ui.notify(`Path not found: ${path}`, "error"); return; }
@@ -199,6 +246,13 @@ export default function (pi: ExtensionAPI) {
     config.ragEnabled = mode === "on";
     saveConfig(config);
     ctx.ui.notify(mode === "on" ? "RAG auto-injection enabled" : "RAG auto-injection disabled", mode === "on" ? "success" : "warning");
+  }
+
+  function cmdAutoRefresh(ctx: RagCommandCtx) {
+    const config = loadConfig();
+    config.ragAutoRefresh = !config.ragAutoRefresh;
+    saveConfig(config);
+    ctx.ui.notify(`Auto-refresh ${config.ragAutoRefresh ? "enabled" : "disabled"}`, config.ragAutoRefresh ? "success" : "warning");
   }
 
   async function cmdRebuild(ctx: RagCommandCtx, force: boolean) {
@@ -410,14 +464,16 @@ export default function (pi: ExtensionAPI) {
     { value: "find", label: "find", description: "Find indexed files by glob" },
     { value: "status", label: "status", description: "Show index statistics" },
     { value: "rebuild", label: "rebuild", description: "Rebuild entire index (--force to skip hash check)" },
+    { value: "refresh", label: "refresh", description: "Refresh tracked paths (re-embed changed files)" },
     { value: "clear", label: "clear", description: "Clear the index" },
     { value: "exclude", label: "exclude", description: "Manage exclude patterns" },
     { value: "on", label: "on", description: "Enable auto-injection" },
     { value: "off", label: "off", description: "Disable auto-injection" },
+    { value: "auto-refresh", label: "auto-refresh", description: "Toggle periodic reindexing" },
   ];
 
   pi.registerCommand("rag", {
-    description: "pi-local-rag: /rag index|search|find|status|rebuild [--force]|clear|exclude|on|off",
+    description: "pi-local-rag: /rag index|search|find|status|rebuild|refresh [--force]|clear|exclude|on|off|auto-refresh",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
       const filtered = RAG_SUBCOMMANDS
         .filter((s) => s.value.startsWith(prefix))
@@ -430,9 +486,8 @@ export default function (pi: ExtensionAPI) {
       switch (cmd) {
         case "index": await cmdIndex(parts[1] || ".", ctx); break;
         case "search": await cmdSearch(parts.slice(1).join(" "), ctx); break;
-        case "exclude": cmdExclude(parts.slice(1).join(" ").trim(), ctx); break;
         case "find": cmdFind(parts.slice(1).join(" ").trim(), ctx); break;
-        case "on": case "off": cmdToggle(cmd, ctx); break;
+        case "refresh": await cmdRefresh(ctx); break;
         case "rebuild": {
           const rebuildArgs = parts.slice(1);
           const force = rebuildArgs.includes("--force");
@@ -440,6 +495,9 @@ export default function (pi: ExtensionAPI) {
           break;
         }
         case "clear": cmdClear(ctx); break;
+        case "exclude": cmdExclude(parts.slice(1).join(" ").trim(), ctx); break;
+        case "on": case "off": cmdToggle(cmd, ctx); break;
+        case "auto-refresh": cmdAutoRefresh(ctx); break;
         default: cmdStatus(ctx);
       }
     },

@@ -33,10 +33,12 @@ pi install git:github.com/theli-ua/pi-local-rag
 | `/rag find <glob>` | Find indexed files by glob pattern |
 | `/rag status` | Show index stats (files, chunks, tokens) |
 | `/rag rebuild` | Re-index changed files, prune deleted |
+| `/rag refresh` | Refresh tracked paths (re-embed changed files) |
 | `/rag clear` | Wipe the entire index |
 | `/rag exclude <pattern>` | Add exclude pattern (prefix `-` to remove) |
 | `/rag on` | Enable auto-injection |
 | `/rag off` | Disable auto-injection |
+| `/rag auto-refresh` | Toggle periodic reindexing |
 
 ## AI Tools
 
@@ -60,7 +62,7 @@ Directories named `node_modules`, `.git`, `.next`, `dist`, `build`, `__pycache__
 
 1. **Index** — files are chunked (~50 lines each), embedded with `Xenova/all-MiniLM-L6-v2` (384-dim), and stored in a local SQLite database with FTS5 (BM25) and sqlite-vec (vector) indexes
 2. **Search** — hybrid scoring: `alpha × BM25 + (1-alpha) × cosine_similarity` (default `alpha=0.4`). BM25 via FTS5's native `bm25()` function, vectors via sqlite-vec nearest-neighbor
-3. **Auto-inject** — before every agent turn, the prompt is searched and relevant chunks are prepended to the system prompt. If the index is stale (>24h), tracked paths are re-walked and changed files are refreshed automatically
+3. **Auto-inject** — before every agent turn, the prompt is searched and relevant chunks are prepended to the system prompt. Periodic reindexing (when `ragAutoRefresh` is enabled) refreshes changed files if the index is stale (>24h).
 
 ## Storage
 
@@ -98,7 +100,8 @@ Auto-injection is on by default. Tune via `/rag status`:
 
 | Setting | Default | Description |
 |---|---|---|
-| `ragEnabled` | `true` | Auto-inject context before each turn |
+| `ragEnabled` | `false` | Auto-inject context before each turn |
 | `ragTopK` | `5` | Max chunks to inject |
 | `ragScoreThreshold` | `0.1` | Min hybrid score to include |
 | `ragAlpha` | `0.4` | BM25/vector blend (0=pure vector, 1=pure BM25) |
+| `ragAutoRefresh` | `false` | Periodic reindexing when index is stale (>24h) |

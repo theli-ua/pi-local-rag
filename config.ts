@@ -8,12 +8,13 @@ export interface RagConfig {
   ragAlpha: number;
   trackedPaths: string[];
   excludePatterns: string[];
+  ragAutoRefresh: boolean;
 }
 
 export function defaultConfig(): RagConfig {
   return {
-    ragEnabled: true, ragTopK: 5, ragScoreThreshold: 0.1, ragAlpha: 0.4,
-    trackedPaths: [], excludePatterns: [],
+    ragEnabled: false, ragTopK: 5, ragScoreThreshold: 0.1, ragAlpha: 0.4,
+    trackedPaths: [], excludePatterns: [], ragAutoRefresh: false,
   };
 }
 
@@ -22,7 +23,7 @@ export function loadConfig(): RagConfig {
   const cfgFile = configFile(ragDir);
   if (!existsSync(cfgFile)) return defaultConfig();
   try {
-    return { ...defaultConfig(), ...JSON.parse(readFileSync(cfgFile, "utf-8")) };
+    return { ...defaultConfig(), ...JSON.parse(readFileSync(cfgFile, "utf-8")) } as RagConfig;
   } catch { return defaultConfig(); }
 }
 
