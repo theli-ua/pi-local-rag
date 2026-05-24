@@ -52,8 +52,16 @@ export async function hybridSearch(
     const hasChunks = database.prepare("SELECT 1 FROM chunks LIMIT 1").get();
     if (!hasChunks) return [];
 
-    // BM25 via FTS5 — cap candidates to avoid scanning entire index
-    const ftsQuery = query.split(/\s+/).map(t => `"${t.replace(/"/g, '""')}"`).join(" ");
+    // BM25 via FTS5 — cap candidates to avoid scanning entire index.
+    // Join terms with OR so any term can match; space-joined phrases are
+    // implicit AND in FTS5 and would require every word to appear in a
+    // single chunk, which essentially never matches for natural-language
+    // queries and forces every result back to vector-only ranking.
+    const ftsQuery = query
+      .split(/\s+/)
+      .filter(t => t.length > 0)
+      .map(t => `"${t.replace(/"/g, '""')}"`)
+      .join(" OR ");
     const ftsLimit = Math.max(limit * 20, 200);
     const ftsResults = database.prepare(`
       SELECT chunks_fts.rowid, bm25(chunks_fts) as bm25_score
@@ -107,7 +115,11 @@ export async function hybridSearch(
     const distances = vecResults.map((r: any) => r.distance);
     const hasVectors = distances.length > 0;
 
-    // Normalize BM25
+    // Normalize BM25.
+    // FTS5 bm25() returns lower-is-better scores (more negative = more
+    // relevant). We invert during min-max normalization so 1.0 represents
+    // the best match — matching the vector-score convention and making the
+    // blended `alpha * bm25 + (1-alpha) * vec` produce intuitive rankings.
     const bm25NormMap = new Map<number, number>();
     if (hasBm25) {
       const bm25Max = Math.max(...bm25Scores);
@@ -117,7 +129,7 @@ export async function hybridSearch(
         for (const r of ftsResults) bm25NormMap.set(r.rowid, 1);
       } else {
         for (const r of ftsResults) {
-          bm25NormMap.set(r.rowid, (r.bm25_score - bm25Min) / bm25Range);
+          bm25NormMap.set(r.rowid, 1 - (r.bm25_score - bm25Min) / bm25Range);
         }
       }
     }
