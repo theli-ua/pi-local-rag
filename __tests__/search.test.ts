@@ -333,6 +333,33 @@ describe("hybridSearch (vector normalization)", () => {
     expect(results[0].hybrid).toBeCloseTo(results[0].bm25, 5);
   });
 
+  it("multi-word query: BM25 matches chunks containing any term (OR semantics)", async () => {
+    // Regression test: pre-fix, multi-word queries were joined with implicit
+    // AND (space-separated quoted phrases in FTS5). Since no single chunk
+    // contained every query term, FTS5 returned zero rows and every result
+    // had bm25 = 0. Post-fix, terms are OR-joined, so chunks matching any
+    // single term receive a BM25 score.
+    const db = makeDb();
+    insertWithAlignedVectors(db, [
+      { id: "c1", file: "/a.ts", content: "keycloak provider configuration",  vector: vec(0) },
+      { id: "c2", file: "/b.ts", content: "argocd application sync settings", vector: vec(1) },
+    ]);
+
+    // No chunk contains BOTH "keycloak" AND "argocd" — only one each.
+    // Pre-fix: implicit AND → 0 FTS rows → bm25 = 0 for every result.
+    // Post-fix: explicit OR  → 2 FTS rows → at least one result has bm25 > 0.
+    const results = await hybridSearch(
+      "keycloak argocd",
+      { chunks: [], files: {}, lastBuild: "" },
+      10,
+      0.4,
+      db,
+    );
+    db.close();
+
+    expect(results.some(r => r.bm25 > 0)).toBe(true);
+  });
+
   it("alpha=0.0 → pure vector (BM25 ignored)", async () => {
     const db = makeDb();
     insertWithAlignedVectors(db, [
